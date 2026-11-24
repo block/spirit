@@ -190,42 +190,44 @@ func indexColumnsEqual(a, b *IndexColumn) bool {
 	return true
 }
 
-// constraintsEqual checks if two constraints are equal
-func constraintsEqual(a, b *Constraint) bool {
+// constraintsEqual checks if two constraints are equal. defaultSchema is
+// DiffOptions.DefaultSchema, the schema an unqualified foreign key reference
+// resolves to; "" leaves an unqualified reference matching any schema.
+func constraintsEqual(a, b *Constraint, defaultSchema string) bool {
 	if a.Name != b.Name {
 		return false
 	}
-	return constraintsEqualIgnoreName(a, b)
+	return constraintsEqualIgnoreName(a, b, defaultSchema)
 }
 
 // constraintsEqualIgnoreName compares two constraints on everything except their name.
 // This is used to detect constraints that are logically identical but have different
 // auto-generated names (e.g., MySQL generates different CHECK constraint names when
 // the original expression text differs only in charset introducers like _utf8mb3).
-func constraintsEqualIgnoreName(a, b *Constraint) bool {
+func constraintsEqualIgnoreName(a, b *Constraint, defaultSchema string) bool {
 	// CHECK constraint enforcement state ([NOT] ENFORCED)
 	if a.NotEnforced != b.NotEnforced {
 		return false
 	}
-	return constraintsEqualIgnoreNameAndEnforcement(a, b)
+	return constraintsEqualIgnoreNameAndEnforcement(a, b, defaultSchema)
 }
 
 // constraintsEqualExceptEnforcement reports whether two same-named CHECK
 // constraints are identical apart from their [NOT] ENFORCED state. Such a
 // pair is applied with a targeted ALTER CHECK clause instead of DROP+ADD.
-func constraintsEqualExceptEnforcement(a, b *Constraint) bool {
+func constraintsEqualExceptEnforcement(a, b *Constraint, defaultSchema string) bool {
 	if a.Type != "CHECK" || b.Type != "CHECK" {
 		return false
 	}
 	if a.NotEnforced == b.NotEnforced {
 		return false // not an enforcement change
 	}
-	return a.Name == b.Name && constraintsEqualIgnoreNameAndEnforcement(a, b)
+	return a.Name == b.Name && constraintsEqualIgnoreNameAndEnforcement(a, b, defaultSchema)
 }
 
 // constraintsEqualIgnoreNameAndEnforcement compares all constraint attributes
 // except the name and the CHECK enforcement state.
-func constraintsEqualIgnoreNameAndEnforcement(a, b *Constraint) bool {
+func constraintsEqualIgnoreNameAndEnforcement(a, b *Constraint, defaultSchema string) bool {
 	if a.Type != b.Type {
 		return false
 	}
@@ -243,10 +245,7 @@ func constraintsEqualIgnoreNameAndEnforcement(a, b *Constraint) bool {
 		if a.References.Table != b.References.Table {
 			return false
 		}
-		// A schema is compared only when both references are qualified: an
-		// unqualified reference means the table's own schema, which a parsed
-		// CREATE TABLE does not know (see ForeignKeyReference).
-		if a.References.Schema != "" && b.References.Schema != "" && a.References.Schema != b.References.Schema {
+		if !referencedSchemasEqual(a.References.Schema, b.References.Schema, defaultSchema) {
 			return false
 		}
 		if !slices.Equal(a.References.Columns, b.References.Columns) {
@@ -261,6 +260,27 @@ func constraintsEqualIgnoreNameAndEnforcement(a, b *Constraint) bool {
 		}
 	}
 	return true
+}
+
+// referencedSchemasEqual compares the schemas two foreign key references
+// name. An unqualified reference means the table's own schema, which a parsed
+// CREATE TABLE does not know (see ForeignKeyReference). When defaultSchema is
+// set (DiffOptions.DefaultSchema) an unqualified reference resolves to it, so
+// `parent` equals `<defaultSchema>.parent` and differs from `other.parent`.
+// When it is empty an unqualified reference matches any schema, and two
+// references differ only when both are qualified with different schemas.
+// Schemas are compared exactly, as the referenced table names are.
+func referencedSchemasEqual(a, b, defaultSchema string) bool {
+	if defaultSchema != "" {
+		if a == "" {
+			a = defaultSchema
+		}
+		if b == "" {
+			b = defaultSchema
+		}
+		return a == b
+	}
+	return a == "" || b == "" || a == b
 }
 
 // isPartitionCountOnlyChange checks if only the partition count changed for HASH/KEY partitions

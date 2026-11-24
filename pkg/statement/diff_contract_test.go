@@ -308,6 +308,20 @@ func TestDiffMySQLContracts(t *testing.T) {
 			source: "(id INT PRIMARY KEY) AUTOEXTEND_SIZE=4M",
 			target: "(id INT PRIMARY KEY)",
 		},
+		// ENCRYPTION='Y' cannot be created without a keyring, so only the
+		// unencrypted spellings are exercised against a live server.
+		{
+			name:     "ENCRYPTION='N' matches a live table that omits it",
+			source:   "(id INT PRIMARY KEY)",
+			target:   "(id INT PRIMARY KEY) ENCRYPTION='N'",
+			wantNoop: true,
+		},
+		{
+			name:     "ENCRYPTION='n' matches a live table that omits it",
+			source:   "(id INT PRIMARY KEY) ENCRYPTION='n'",
+			target:   "(id INT PRIMARY KEY) ENCRYPTION='N'",
+			wantNoop: true,
+		},
 		{
 			name:   "table SECONDARY_ENGINE_ATTRIBUTE is applied",
 			source: "(id INT PRIMARY KEY)",

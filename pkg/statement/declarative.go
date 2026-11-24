@@ -181,11 +181,23 @@ func tablesByName(tables []table.TableSchema, key func(string) string, opts *Dif
 // reference in its own case (lower case under lower_case_table_names=1),
 // whatever case the schema file wrote it in. Under exact matching the key is
 // the name itself, so nothing changes.
-func matchReferenceCase(current, desired *CreateTable, key func(string) string) {
+//
+// defaultSchema is DiffOptions.DefaultSchema. When it is set an unqualified
+// reference is keyed by it, so a reference qualified with the table's own
+// schema (in any case the key folds) is matched with the unqualified one
+// SHOW CREATE TABLE prints, instead of keying as a different schema.
+func matchReferenceCase(current, desired *CreateTable, key func(string) string, defaultSchema string) {
+	refKey := func(ref *ForeignKeyReference) string {
+		schema := ref.Schema
+		if schema == "" {
+			schema = defaultSchema
+		}
+		return key(schema) + "." + key(ref.Table)
+	}
 	stored := make(map[string]*ForeignKeyReference)
 	for i := range current.Constraints {
 		if ref := current.Constraints[i].References; ref != nil {
-			stored[key(ref.Schema)+"."+key(ref.Table)] = ref
+			stored[refKey(ref)] = ref
 		}
 	}
 	for i := range desired.Constraints {
@@ -193,7 +205,7 @@ func matchReferenceCase(current, desired *CreateTable, key func(string) string) 
 		if ref == nil {
 			continue
 		}
-		if match, ok := stored[key(ref.Schema)+"."+key(ref.Table)]; ok {
+		if match, ok := stored[refKey(ref)]; ok {
 			ref.Schema, ref.Table = match.Schema, match.Table
 		}
 	}
@@ -232,7 +244,11 @@ func diffTable(name, currentSchema, desiredSchema string, opts *DiffOptions) (st
 	if tableNameKey(opts)(b.TableName) == tableNameKey(opts)(a.TableName) {
 		b.TableName = a.TableName
 	}
-	matchReferenceCase(a, b, tableNameKey(opts))
+	defaultSchema := ""
+	if opts != nil {
+		defaultSchema = opts.DefaultSchema
+	}
+	matchReferenceCase(a, b, tableNameKey(opts), defaultSchema)
 	defer func() {
 		if r := recover(); r != nil {
 			stmts = nil

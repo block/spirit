@@ -343,9 +343,10 @@ func (c *Column) declaresNullAfterAutoIncrement() bool {
 // reference qualified with the table's own schema reads back unqualified, so
 // an empty Schema means the table's own schema — which a parsed CREATE TABLE
 // does not know. Two references therefore compare equal unless both are
-// qualified and name different schemas (see
-// constraintsEqualIgnoreNameAndEnforcement); a desired REFERENCES db2.parent
-// is not told apart from a live REFERENCES parent, whichever schema that is.
+// qualified and name different schemas (see referencedSchemasEqual); a
+// desired REFERENCES db2.parent is not told apart from a live REFERENCES
+// parent, whichever schema that is. DiffOptions.DefaultSchema names the
+// table's schema and removes that blind spot.
 type ForeignKeyReference struct {
 	Schema   string   `json:"schema,omitempty"`
 	Table    string   `json:"table"`
@@ -394,6 +395,11 @@ type TableOptions struct {
 	// text as written; compared as JSON (engineAttributeEqual) because MySQL
 	// reports it re-serialized, and emitted as written. '' is not recorded.
 	SecondaryEngineAttribute *string `json:"secondary_engine_attribute,omitempty"`
+	// Encryption is the table's ENCRYPTION option ('Y' or 'N'; MySQL accepts
+	// either case). encryptionNormalizer upper-cases it and keeps an explicit
+	// 'N' distinct from an absent option; diffTableOptions (encryptionClause)
+	// decides what an absent or 'N' value means when diffing.
+	Encryption *string `json:"encryption,omitempty"`
 }
 
 // PartitionOptions represents table partitioning configuration
@@ -1348,6 +1354,10 @@ func (ct *CreateTable) parseTableOptions(options []*ast.TableOption) *TableOptio
 			if option.StrValue != "" {
 				tableOpts.SecondaryEngineAttribute = &option.StrValue
 			}
+		case ast.TableOptionEncryption:
+			if option.StrValue != "" {
+				tableOpts.Encryption = &option.StrValue
+			}
 		case ast.TableOptionRowFormat:
 			// ROW_FORMAT=DEFAULT is the absence of a row format: MySQL stores
 			// nothing for it, SHOW CREATE TABLE omits it, and the table takes
@@ -1819,7 +1829,7 @@ func (ct *CreateTable) diff(target *CreateTable, opts *DiffOptions, tightenedCol
 	// 3. Diff constraints (DROP, ADD). A foreign key added back under a name
 	// the same diff drops takes a replacement name, because MySQL rejects the
 	// same-name DROP and ADD in one ALTER (error 1826).
-	constraintClauses := ct.diffConstraints(target, rebuilt, takenNames)
+	constraintClauses := ct.diffConstraints(target, rebuilt, takenNames, opts.DefaultSchema)
 	alterClauses = append(alterClauses, constraintClauses...)
 
 	// 4. Diff table options
@@ -2639,7 +2649,7 @@ func replacementName(name string, taken map[string]bool) string {
 // it creates for a foreign key after the constraint when the columns have
 // none); a collision with a foreign key of another table in the schema fails
 // the ALTER with error 1826, and nothing has changed.
-func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames map[string]bool) (clauses []string) {
+func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames map[string]bool, defaultSchema string) (clauses []string) {
 
 	var p *parser.Parser
 	readsRebuilt := func(c *Constraint) bool {
@@ -2695,7 +2705,7 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 			if matchedTargetByExpression[constraintKey(targetConstr)] || readsRebuilt(targetConstr) {
 				continue // already paired with another source constraint, or re-added for a rebuild
 			}
-			if constraintsEqualIgnoreName(sourceConstr, targetConstr) {
+			if constraintsEqualIgnoreName(sourceConstr, targetConstr, defaultSchema) {
 				matchedSourceByExpression[constraintKey(sourceConstr)] = true
 				matchedTargetByExpression[constraintKey(targetConstr)] = true
 				break
@@ -2720,8 +2730,8 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 		}
 
 		// Drop if constraint doesn't exist in target OR if it changed
-		if rebuild || !exists || !constraintsEqual(sourceConstr, targetConstr) {
-			if !rebuild && exists && constraintsEqualExceptEnforcement(sourceConstr, targetConstr) {
+		if rebuild || !exists || !constraintsEqual(sourceConstr, targetConstr, defaultSchema) {
+			if !rebuild && exists && constraintsEqualExceptEnforcement(sourceConstr, targetConstr, defaultSchema) {
 				// Only the [NOT] ENFORCED state changed: use MySQL's targeted
 				// ALTER CHECK clause instead of DROP+ADD. Flipping to NOT
 				// ENFORCED is then metadata-only (INSTANT-capable); flipping
@@ -2759,8 +2769,8 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 		sourceConstr, existsInSource := sourceConstraints[constraintKey(&targetConstr)]
 		rebuild := droppedForRebuild[constraintKey(&targetConstr)] || readsRebuilt(&targetConstr)
 
-		if rebuild || !existsInSource || !constraintsEqual(sourceConstr, &targetConstr) {
-			if !rebuild && existsInSource && constraintsEqualExceptEnforcement(sourceConstr, &targetConstr) {
+		if rebuild || !existsInSource || !constraintsEqual(sourceConstr, &targetConstr, defaultSchema) {
+			if !rebuild && existsInSource && constraintsEqualExceptEnforcement(sourceConstr, &targetConstr, defaultSchema) {
 				continue // enforcement-only change; handled by ALTER CHECK above
 			}
 			if targetConstr.Type == "FOREIGN KEY" && droppedForeignKeys[strings.ToLower(targetConstr.Name)] {
@@ -2896,6 +2906,9 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 	optionClause("CHECKSUM", flagText(source.Checksum), flagText(dest.Checksum), "0")
 	optionClause("DELAY_KEY_WRITE", flagText(source.DelayKeyWrite), flagText(dest.DelayKeyWrite), "0")
 	optionClause("AUTOEXTEND_SIZE", uintText(source.AutoextendSize), uintText(dest.AutoextendSize), "0")
+	if clause := encryptionClause(source.Encryption, dest.Encryption); clause != "" {
+		clauses = append(clauses, clause)
+	}
 	if !engineAttributeEqual(source.SecondaryEngineAttribute, dest.SecondaryEngineAttribute) {
 		attr := ""
 		if dest.SecondaryEngineAttribute != nil {
@@ -2905,6 +2918,29 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 	}
 
 	return clauses
+}
+
+// encryptionClause returns the ENCRYPTION clause that takes a table with the
+// source option to one declared with the dest option, or "" when none is
+// needed. Absent and 'N' are the same state on the live side (SHOW CREATE
+// TABLE prints no ENCRYPTION for an unencrypted table on a server whose
+// default is OFF), so they compare equal; but an absent option on the declared
+// side means "not specified" and is never changed: where encryption is the
+// default an omitted option is encrypted, and planning ENCRYPTION='N' for it
+// would decrypt every such table. Only a declared 'N' decrypts, and only a
+// table that is encrypted. See encryptionNormalizer.
+func encryptionClause(source, dest *string) string {
+	if dest == nil {
+		return ""
+	}
+	current := "N"
+	if source != nil {
+		current = *source
+	}
+	if current == *dest {
+		return ""
+	}
+	return "ENCRYPTION='" + sqlescape.EscapeString(*dest) + "'"
 }
 
 // uintText, boolText and flagText render an optional table option value as

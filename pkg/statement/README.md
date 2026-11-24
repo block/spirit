@@ -315,6 +315,16 @@ statements. An option-only change to a primary key's `KEY_BLOCK_SIZE` or
 name swap used for secondary indexes. Primary key comments still use the
 combined statement, which MySQL applies.
 
+`ENCRYPTION` is always compared, with one asymmetry: a desired schema that
+omits the option never changes it. An explicit `ENCRYPTION='Y'` encrypts a table
+that is not already encrypted, and an explicit `ENCRYPTION='N'` decrypts a table
+that is encrypted (a live table with no `ENCRYPTION` counts as unencrypted, so a
+declared `'N'` against it is a no-op). A schema that wants a table decrypted must
+say `ENCRYPTION='N'`. This keeps a schema written without the option from
+decrypting every table on a server where encryption is the default
+(`default_table_encryption=ON` or `DEFAULT ENCRYPTION='Y'`). There is no
+`Ignore` option for it: it is declared schema, like `SECONDARY_ENGINE_ATTRIBUTE`.
+
 ```go
 type TableOptions struct {
     Engine, Charset, Collation, Comment, RowFormat *string
@@ -329,6 +339,7 @@ type TableOptions struct {
     DelayKeyWrite    bool
     AvgRowLength, MinRows, MaxRows *uint64
     SecondaryEngineAttribute *string // JSON text as written; compared as JSON
+    Encryption *string // "Y" or "N" (upper-cased); nil = not specified, never changed by Diff
 }
 ```
 
@@ -363,6 +374,8 @@ type Constraint struct {
 ```
 
 A `ForeignKeyReference` records the referenced `Schema` when the reference is qualified (`REFERENCES db.parent`) and leaves it empty otherwise. MySQL qualifies a reference in `SHOW CREATE TABLE` only when the parent is in another schema, and a reference qualified with the table's own schema reads back unqualified, so an empty `Schema` means the table's own schema — which a parsed `CREATE TABLE` does not know. Two references therefore differ on schema only when both are qualified and name different schemas; a desired `REFERENCES db2.parent` is not told apart from a live `REFERENCES parent`.
+
+`DiffOptions.DefaultSchema` removes that blind spot. Set it to the schema the tables live in (`opts.DefaultSchema = "mydb"`) and `Diff` resolves an unqualified reference to it on both sides before comparing: `parent` equals `mydb.parent`, and `parent` differs from `other_db.parent`, which the diff emits as a foreign key change (a `DROP FOREIGN KEY` plus an `ADD CONSTRAINT` under a replacement name). Schema names are compared exactly, as the referenced table names are. A reference the diff emits is written as the target spells it, so an unqualified one stays unqualified. Left empty (the default), the behavior above is unchanged.
 
 ### Partition Information
 
@@ -469,6 +482,7 @@ Two layers of canonicalization apply:
    | `partitionKeyAlgorithmNormalizer` | folds `KEY ALGORITHM=2`, MySQL's default, into the omitted form `SHOW CREATE TABLE` prints, on partitioning and subpartitioning. `ALGORITHM=1` is a different row placement and is kept |
    | `partitionCommentNormalizer` | pushes a partition-level `COMMENT` down onto explicitly named subpartitions that have none, and clears it from the partition — what MySQL stores for `PARTITION p0 ... COMMENT 'c' (SUBPARTITION s0, SUBPARTITION s1)`. A partition comment on implicit subpartitions (`SUBPARTITIONS n`) stays on the partition |
    | `engineNormalizer` | rewrites the table `ENGINE` to the name `SHOW CREATE TABLE` reports, since MySQL resolves engine names case-insensitively and through legacy aliases: `ENGINE=innodb` and `ENGINE=innobase` → `InnoDB`, `myisam` → `MyISAM`, `heap` → `MEMORY`, `merge` and `mrg_myisam` → `MRG_MyISAM`, and `CSV`, `ARCHIVE` and `BLACKHOLE` in any case. Without it a schema that writes `ENGINE=innodb` diffs to `ENGINE=InnoDB` on every run when `IgnoreEngine` is false. An engine not in that list keeps its written spelling. Per-partition `ENGINE` clauses are not compared, so they are left alone |
+   | `encryptionNormalizer` | upper-cases the table `ENCRYPTION` value (MySQL reads `'y'` and `'Y'` alike but prints the case it was given) and keeps an explicit `ENCRYPTION='N'` distinct from an absent option. What an omitted option means depends on the server (`default_table_encryption`) and the schema (`DEFAULT ENCRYPTION`), which a parsed `CREATE TABLE` does not know, so the diff decides from the desired value: an omitted option is never changed, `'Y'` encrypts, and `'N'` decrypts only a table that is encrypted (a live table with no `ENCRYPTION` is unencrypted, as `SHOW CREATE TABLE` prints nothing for it when `default_table_encryption=OFF`). A schema that wants a table decrypted must say `ENCRYPTION='N'`. A value other than `Y` or `N` keeps its spelling (MySQL rejects it) |
 
 ### Pipeline
 

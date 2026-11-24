@@ -53,7 +53,7 @@ func TestDiffIntegrationIndexSwapWithImplicitForeignKeyIndex(t *testing.T) {
 			got, err := ParseCreateTable(showCreateTable(t, db, "t"))
 			require.NoError(t, err)
 			require.Len(t, got.Constraints, 1)
-			require.True(t, constraintsEqualIgnoreName(&want.Constraints[0], &got.Constraints[0]))
+			require.True(t, constraintsEqualIgnoreName(&want.Constraints[0], &got.Constraints[0], ""))
 			var expectedIndex, actualIndex *Index
 			for i := range want.Indexes {
 				if want.Indexes[i].Name == tc.indexName {
