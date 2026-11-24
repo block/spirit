@@ -242,6 +242,38 @@ func TestOptimizerHintsRestoreStatement(t *testing.T) {
 	}
 }
 
+// TestOptimizerHintRestoreKeepsCommentClosed restores hints whose quoted
+// values spell */ through a backslash. MySQL's hint lexer reads 'a*\/ x' as
+// a*\/ x, so restoring it as 'a*/ x' would end the hint comment early and
+// turn the rest of the value into SQL. The only */ in the restored statement
+// must be the one that closes the hint comment.
+func TestOptimizerHintRestoreKeepsCommentClosed(t *testing.T) {
+	testCases := []struct {
+		sql    string
+		expect string
+	}{
+		{
+			"SELECT /*+ SET_VAR(sql_mode='a*\\/ UNION SELECT 2 -- ') */ 1 FROM t LIMIT 10",
+			"SELECT /*+ SET_VAR(sql_mode = 'a*\\/ UNION SELECT 2 -- ')*/ 1 FROM `t` LIMIT 10",
+		},
+		{
+			"SELECT /*+ SET_VAR(sql_mode=\"a*\\/ x\") RESOURCE_GROUP(`rg*\\/`) */ 1",
+			"SELECT /*+ SET_VAR(sql_mode = 'a*\\/ x') RESOURCE_GROUP(`rg*\\/`)*/ 1",
+		},
+	}
+	p := parser.New()
+	for _, tc := range testCases {
+		stmts, _, err := p.Parse(tc.sql, "", "")
+		require.NoError(t, err, tc.sql)
+		require.Len(t, stmts, 1, tc.sql)
+		var sb strings.Builder
+		require.NoError(t, stmts[0].Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)), tc.sql)
+		restored := sb.String()
+		require.Equal(t, tc.expect, restored, tc.sql)
+		require.Equal(t, 1, strings.Count(restored, "*/"), restored)
+	}
+}
+
 // TestOptimizerHintRestoreSetVarValue covers hand-built SET_VAR values: an
 // unquoted value that is not a single bare token is quoted, so the restored
 // hint stays one value.
