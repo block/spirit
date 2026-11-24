@@ -1,6 +1,8 @@
 module github.com/block/spirit
 
-go 1.26.11
+go 1.26.0
+
+toolchain go1.26.11
 
 require (
 	github.com/alecthomas/kong v1.17.0
