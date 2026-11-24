@@ -2973,6 +2973,29 @@ func TestDiff_DiffOptions(t *testing.T) {
 			opts:     &DiffOptions{IgnoreEngine: false},
 			expected: "ALTER TABLE `t1` ENGINE=MyISAM",
 		},
+		{
+			// MySQL resolves engine names case-insensitively, so a lowercase
+			// ENGINE in hand-written SQL matches SHOW CREATE TABLE's InnoDB.
+			name:     "ExplicitDetectEngine_CaseInsensitive",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=InnoDB",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=innodb",
+			opts:     &DiffOptions{IgnoreEngine: false},
+			expected: "",
+		},
+		{
+			name:     "ExplicitDetectEngine_CaseInsensitiveReverse",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=innodb",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=INNODB",
+			opts:     &DiffOptions{IgnoreEngine: false},
+			expected: "",
+		},
+		{
+			name:     "ExplicitDetectEngine_DifferentEngineLowercase",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=innodb",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=myisam",
+			opts:     &DiffOptions{IgnoreEngine: false},
+			expected: "ALTER TABLE `t1` ENGINE=myisam",
+		},
 
 		// Explicit IgnoreAutoIncrement=false detects auto_increment changes
 		{
