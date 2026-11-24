@@ -394,6 +394,11 @@ type TableOptions struct {
 	// text as written; compared as JSON (engineAttributeEqual) because MySQL
 	// reports it re-serialized, and emitted as written. '' is not recorded.
 	SecondaryEngineAttribute *string `json:"secondary_engine_attribute,omitempty"`
+	// Encryption is the table's ENCRYPTION option ('Y' or 'N'; MySQL accepts
+	// either case). encryptionNormalizer upper-cases it and drops 'N', so a
+	// parsed table carries it only when it is encrypted: SHOW CREATE TABLE
+	// omits ENCRYPTION='N' on a server whose default_table_encryption is OFF.
+	Encryption *string `json:"encryption,omitempty"`
 }
 
 // PartitionOptions represents table partitioning configuration
@@ -1347,6 +1352,10 @@ func (ct *CreateTable) parseTableOptions(options []*ast.TableOption) *TableOptio
 		case ast.TableOptionSecondaryEngineAttribute:
 			if option.StrValue != "" {
 				tableOpts.SecondaryEngineAttribute = &option.StrValue
+			}
+		case ast.TableOptionEncryption:
+			if option.StrValue != "" {
+				tableOpts.Encryption = &option.StrValue
 			}
 		case ast.TableOptionRowFormat:
 			// ROW_FORMAT=DEFAULT is the absence of a row format: MySQL stores
@@ -2896,6 +2905,10 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 	optionClause("CHECKSUM", flagText(source.Checksum), flagText(dest.Checksum), "0")
 	optionClause("DELAY_KEY_WRITE", flagText(source.DelayKeyWrite), flagText(dest.DelayKeyWrite), "0")
 	optionClause("AUTOEXTEND_SIZE", uintText(source.AutoextendSize), uintText(dest.AutoextendSize), "0")
+	// ENCRYPTION is quoted in the clause. A table that is not encrypted has
+	// no Encryption (see encryptionNormalizer), so clearing one is
+	// ENCRYPTION='N'.
+	optionClause("ENCRYPTION", quotedText(source.Encryption), quotedText(dest.Encryption), "'N'")
 	if !engineAttributeEqual(source.SecondaryEngineAttribute, dest.SecondaryEngineAttribute) {
 		attr := ""
 		if dest.SecondaryEngineAttribute != nil {
@@ -2915,6 +2928,15 @@ func uintText(v *uint64) *string {
 		return nil
 	}
 	return new(strconv.FormatUint(*v, 10))
+}
+
+// quotedText renders an optional string table option as a SQL string literal,
+// or nil when it is unset.
+func quotedText(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	return new("'" + sqlescape.EscapeString(*v) + "'")
 }
 
 func boolText(v *bool) *string {
