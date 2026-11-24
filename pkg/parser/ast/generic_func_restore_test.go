@@ -162,3 +162,18 @@ func TestGenericFuncNameReservedInMySQLIsQuoted(t *testing.T) {
 		})
 	}
 }
+
+// A schema-qualified call is restored as name(args), never through the
+// CONVERT ... USING / DATE_ADD ... INTERVAL rewrites.
+func TestSchemaQualifiedKeywordNameRestoresAsWritten(t *testing.T) {
+	cases := []struct{ src, want string }{
+		{"SELECT db.CONVERT(a, b)", "SELECT `db`.CONVERT(`a`, `b`)"},
+		{"SELECT db.ADDDATE(a, b, c)", "SELECT `db`.ADDDATE(`a`, `b`, `c`)"},
+		{"SELECT db.SUBDATE(a, b, c)", "SELECT `db`.SUBDATE(`a`, `b`, `c`)"},
+		{"SELECT db.WEIGHT_STRING(a, 'char', 3)", "SELECT `db`.WEIGHT_STRING(`a`, 'char', 3)"},
+	}
+	for _, tc := range cases {
+		restored, _ := restoreRoundTrip(t, tc.src)
+		require.Equal(t, tc.want, restored)
+	}
+}
