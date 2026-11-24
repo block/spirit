@@ -30,6 +30,8 @@ import (
 	hints []*ast.TableOptimizerHint
 	table 	ast.HintTable
 	modelIdents []ast.CIStr
+	strategies []string
+	setVar     ast.HintSetVar
 }
 
 %token	<number>
@@ -41,7 +43,10 @@ import (
 
 	/*yy:token "%c" */
 	hintIdentifier
-	hintInvalid    "a special token never used by parser, used by lexer to indicate error"
+
+	/*yy:token "`%c`" */
+	hintQuotedIdentifier "a quoted identifier"
+	hintInvalid          "a special token never used by parser, used by lexer to indicate error"
 
 	/*yy:token "@%c" */
 	hintSingleAtIdentifier "identifier with single leading at"
@@ -53,34 +58,43 @@ import (
 	hintNumericLit
 
 	/* MySQL 8.0 hint names */
-	hintJoinFixedOrder      "JOIN_FIXED_ORDER"
-	hintJoinOrder           "JOIN_ORDER"
-	hintJoinPrefix          "JOIN_PREFIX"
-	hintJoinSuffix          "JOIN_SUFFIX"
-	hintBKA                 "BKA"
-	hintNoBKA               "NO_BKA"
-	hintBNL                 "BNL"
-	hintNoBNL               "NO_BNL"
-	hintHashJoin            "HASH_JOIN"
-	hintNoHashJoin          "NO_HASH_JOIN"
-	hintMerge               "MERGE"
-	hintNoMerge             "NO_MERGE"
-	hintIndexMerge          "INDEX_MERGE"
-	hintNoIndexMerge        "NO_INDEX_MERGE"
-	hintMRR                 "MRR"
-	hintNoMRR               "NO_MRR"
-	hintNoICP               "NO_ICP"
-	hintNoRangeOptimization "NO_RANGE_OPTIMIZATION"
-	hintSkipScan            "SKIP_SCAN"
-	hintNoSkipScan          "NO_SKIP_SCAN"
-	hintSemijoin            "SEMIJOIN"
-	hintNoSemijoin          "NO_SEMIJOIN"
-	hintOrderIndex          "ORDER_INDEX"
-	hintNoOrderIndex        "NO_ORDER_INDEX"
-	hintMaxExecutionTime    "MAX_EXECUTION_TIME"
-	hintSetVar              "SET_VAR"
-	hintResourceGroup       "RESOURCE_GROUP"
-	hintQBName              "QB_NAME"
+	hintJoinFixedOrder        "JOIN_FIXED_ORDER"
+	hintJoinOrder             "JOIN_ORDER"
+	hintJoinPrefix            "JOIN_PREFIX"
+	hintJoinSuffix            "JOIN_SUFFIX"
+	hintBKA                   "BKA"
+	hintNoBKA                 "NO_BKA"
+	hintBNL                   "BNL"
+	hintNoBNL                 "NO_BNL"
+	hintHashJoin              "HASH_JOIN"
+	hintNoHashJoin            "NO_HASH_JOIN"
+	hintMerge                 "MERGE"
+	hintNoMerge               "NO_MERGE"
+	hintIndexMerge            "INDEX_MERGE"
+	hintNoIndexMerge          "NO_INDEX_MERGE"
+	hintMRR                   "MRR"
+	hintNoMRR                 "NO_MRR"
+	hintNoICP                 "NO_ICP"
+	hintNoRangeOptimization   "NO_RANGE_OPTIMIZATION"
+	hintSkipScan              "SKIP_SCAN"
+	hintNoSkipScan            "NO_SKIP_SCAN"
+	hintSemijoin              "SEMIJOIN"
+	hintNoSemijoin            "NO_SEMIJOIN"
+	hintOrderIndex            "ORDER_INDEX"
+	hintNoOrderIndex          "NO_ORDER_INDEX"
+	hintMaxExecutionTime      "MAX_EXECUTION_TIME"
+	hintDerivedCondPushdown   "DERIVED_CONDITION_PUSHDOWN"
+	hintNoDerivedCondPushdown "NO_DERIVED_CONDITION_PUSHDOWN"
+	hintGroupIndex            "GROUP_INDEX"
+	hintNoGroupIndex          "NO_GROUP_INDEX"
+	hintIndex                 "INDEX"
+	hintNoIndex               "NO_INDEX"
+	hintJoinIndex             "JOIN_INDEX"
+	hintNoJoinIndex           "NO_JOIN_INDEX"
+	hintSubquery              "SUBQUERY"
+	hintSetVar                "SET_VAR"
+	hintResourceGroup         "RESOURCE_GROUP"
+	hintQBName                "QB_NAME"
 
 	/* SEMIJOIN() strategies */
 	hintDupsWeedOut     "DUPSWEEDOUT"
@@ -88,18 +102,19 @@ import (
 	hintLooseScan       "LOOSESCAN"
 	hintMaterialization "MATERIALIZATION"
 
+	/* SUBQUERY() strategies (besides MATERIALIZATION) */
+	hintIntoExists "INTOEXISTS"
+
 %type	<ident>
-	Identifier                             "identifier (including keywords)"
-	QueryBlockOpt                          "Query block identifier optional"
+	Identifier                  "identifier (including keywords)"
+	UnquotedIdentifier          "unquoted identifier (including keywords)"
+	QueryBlockOpt               "Query block identifier optional"
 	JoinOrderOptimizerHintName
-	UnsupportedTableLevelOptimizerHintName
-	SupportedTableLevelOptimizerHintName
-	UnsupportedIndexLevelOptimizerHintName
-	SupportedIndexLevelOptimizerHintName
-	SubqueryOptimizerHintName
-	NullaryHintName                        "name of hints which take no input"
+	TableLevelOptimizerHintName
+	IndexLevelOptimizerHintName
+	SemijoinOptimizerHintName
+	SemijoinStrategy
 	SubqueryStrategy
-	Value                                  "the value in the SET_VAR() hint"
 
 %type	<number>
 	CommaOpt "optional ','"
@@ -112,11 +127,10 @@ import (
 	HintTableList         "table list in optimizer hint"
 	HintTableListOpt      "optional table list in optimizer hint"
 	HintIndexList         "table name with index list in optimizer hint"
+	HintIndexListOpt      "optional table name with index list in optimizer hint"
 	IndexNameList         "index list in optimizer hint"
 	IndexNameListOpt      "optional index list in optimizer hint"
 	ViewNameList          "view name list in optimizer hint"
-	SubqueryStrategies    "subquery strategies"
-	SubqueryStrategiesOpt "optional subquery strategies"
 
 %type	<table>
 	HintTable "Table in optimizer hint"
@@ -125,13 +139,29 @@ import (
 %type	<modelIdents>
 	PartitionList "partition name list in optimizer hint"
 
+%type	<setVar>
+	Value "the value in the SET_VAR() hint"
+
+%type	<strategies>
+	SemijoinStrategies    "semijoin strategies"
+	SemijoinStrategiesOpt "optional semijoin strategies"
+
 
 %start	Start
 
 %%
 
+/*
+ * Like MySQL (start: hint_list error HINT_CLOSE), a syntax error keeps the
+ * hints parsed before it and drops the rest of the comment. The error is
+ * still reported as a warning.
+ */
 Start:
 	OptimizerHintList
+	{
+		parser.result = $1
+	}
+|	OptimizerHintList error
 	{
 		parser.result = $1
 	}
@@ -155,40 +185,53 @@ OptimizerHintList:
 TableOptimizerHintOpt:
 	"JOIN_FIXED_ORDER" '(' QueryBlockOpt ')'
 	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
+		$$ = &ast.TableOptimizerHint{
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
+		}
 	}
 |	JoinOrderOptimizerHintName '(' HintTableList ')'
 	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
+		h := $3
+		h.HintName = ast.NewCIStr($1)
+		$$ = h
 	}
-|	UnsupportedTableLevelOptimizerHintName '(' HintTableListOpt ')'
-	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
-	}
-|	SupportedTableLevelOptimizerHintName '(' HintTableListOpt ')'
+|	TableLevelOptimizerHintName '(' HintTableListOpt ')'
 	{
 		h := $3
 		h.HintName = ast.NewCIStr($1)
 		$$ = h
 	}
-|	UnsupportedIndexLevelOptimizerHintName '(' HintIndexList ')'
-	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
-	}
-|	SupportedIndexLevelOptimizerHintName '(' HintIndexList ')'
+|	IndexLevelOptimizerHintName '(' HintIndexList ')'
 	{
 		h := $3
 		h.HintName = ast.NewCIStr($1)
 		$$ = h
 	}
-|	SubqueryOptimizerHintName '(' QueryBlockOpt SubqueryStrategiesOpt ')'
+|	"NO_INDEX_MERGE" '(' HintIndexListOpt ')'
 	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
+		h := $3
+		h.HintName = ast.NewCIStr($1)
+		$$ = h
+	}
+|	SemijoinOptimizerHintName '(' QueryBlockOpt SemijoinStrategiesOpt ')'
+	{
+		h := &ast.TableOptimizerHint{
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
+		}
+		if len($4) > 0 {
+			h.HintData = $4
+		}
+		$$ = h
+	}
+|	"SUBQUERY" '(' QueryBlockOpt SubqueryStrategy ')'
+	{
+		$$ = &ast.TableOptimizerHint{
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
+			HintData: []string{$4},
+		}
 	}
 |	"MAX_EXECUTION_TIME" '(' QueryBlockOpt hintIntLit ')'
 	{
@@ -200,12 +243,11 @@ TableOptimizerHintOpt:
 	}
 |	"SET_VAR" '(' Identifier '=' Value ')'
 	{
+		v := $5
+		v.VarName = $3
 		$$ = &ast.TableOptimizerHint{
 			HintName: ast.NewCIStr($1),
-			HintData: ast.HintSetVar{
-				VarName: $3,
-				Value:   $5,
-			},
+			HintData: v,
 		}
 	}
 |	"RESOURCE_GROUP" '(' Identifier ')'
@@ -228,13 +270,6 @@ TableOptimizerHintOpt:
 			HintName: ast.NewCIStr($1),
 			QBName:   ast.NewCIStr($3),
 			Tables:   $5.Tables,
-		}
-	}
-|	NullaryHintName '(' QueryBlockOpt ')'
-	{
-		$$ = &ast.TableOptimizerHint{
-			HintName: ast.NewCIStr($1),
-			QBName:   ast.NewCIStr($3),
 		}
 	}
 |	hintIdentifier '(' QueryBlockOpt hintIntLit ')'
@@ -365,6 +400,15 @@ ViewName:
  *	[@query_block_name] tbl_name [index_name [, index_name] ...]
  *	tbl_name@query_block_name [index_name [, index_name] ...]
  */
+HintIndexListOpt:
+	HintIndexList
+|	QueryBlockOpt
+	{
+		$$ = &ast.TableOptimizerHint{
+			QBName: ast.NewCIStr($1),
+		}
+	}
+
 HintIndexList:
 	QueryBlockOpt HintTable CommaOpt IndexNameListOpt
 	{
@@ -398,47 +442,72 @@ IndexNameList:
 /**
  * Miscellaneous rules
  */
-SubqueryStrategiesOpt:
+SemijoinStrategiesOpt:
 	/* empty */
-	{}
-|	SubqueryStrategies
+	{
+		$$ = nil
+	}
+|	SemijoinStrategies
 
-SubqueryStrategies:
-	SubqueryStrategy
-	{}
-|	SubqueryStrategies ',' SubqueryStrategy
+SemijoinStrategies:
+	SemijoinStrategy
+	{
+		$$ = []string{$1}
+	}
+|	SemijoinStrategies ',' SemijoinStrategy
+	{
+		$$ = append($1, $3)
+	}
 
+/**
+ * Value: MySQL reads a quoted value (a string literal or a quoted identifier)
+ * and an unquoted word as a string, and a bare number, which may carry a
+ * K/M/G suffix and then lexes as an identifier, as a number. Quoted records
+ * which one it was so that Restore writes it back the same way. A signed
+ * value is a syntax error in MySQL; it keeps its sign so that it restores
+ * unchanged.
+ */
 Value:
 	hintStringLit
-|	Identifier
+	{
+		$$ = ast.HintSetVar{Value: $1, Quoted: true}
+	}
+|	hintQuotedIdentifier
+	{
+		$$ = ast.HintSetVar{Value: $1, Quoted: true}
+	}
+|	UnquotedIdentifier
+	{
+		$$ = ast.HintSetVar{Value: $1}
+	}
 |	hintNumericLit
+	{
+		$$ = ast.HintSetVar{Value: $1}
+	}
 |	hintIntLit
 	{
-		$$ = strconv.FormatUint($1, 10)
+		$$ = ast.HintSetVar{Value: strconv.FormatUint($1, 10)}
 	}
 |	'+' hintNumericLit
 	{
-		$$ = $2
+		$$ = ast.HintSetVar{Value: "+" + $2}
 	}
 |	'-' hintNumericLit
 	{
-		$$ = "-" + $2
+		$$ = ast.HintSetVar{Value: "-" + $2}
 	}
 |	'+' hintIntLit
 	{
-		$$ = strconv.FormatUint($2, 10)
+		$$ = ast.HintSetVar{Value: "+" + strconv.FormatUint($2, 10)}
 	}
 |	'-' hintIntLit
 	{
 		if $2 > 9223372036854775808 {
 			yylex.AppendError(yylex.Errorf("the Signed Value should be at the range of [-9223372036854775808, 9223372036854775807]."))
 			return 1
-		} else if $2 == 9223372036854775808 {
-			signed_one := int64(1)
-			$$ = strconv.FormatInt(signed_one<<63, 10)
-		} else {
-			$$ = strconv.FormatInt(-int64($2), 10)
 		}
+		// Keep the text as written, so -0 does not lose its sign.
+		$$ = ast.HintSetVar{Value: "-" + strconv.FormatUint($2, 10)}
 	}
 
 JoinOrderOptimizerHintName:
@@ -446,46 +515,70 @@ JoinOrderOptimizerHintName:
 |	"JOIN_PREFIX"
 |	"JOIN_SUFFIX"
 
-UnsupportedTableLevelOptimizerHintName:
+/**
+ * Table-level hints:
+ *
+ *	hint_name([@query_block_name] [tbl_name [, tbl_name] ...])
+ *	hint_name([tbl_name@query_block_name [, tbl_name@query_block_name] ...])
+ */
+TableLevelOptimizerHintName:
 	"BKA"
 |	"NO_BKA"
 |	"BNL"
 |	"NO_BNL"
-|	"NO_MERGE"
-
-SupportedTableLevelOptimizerHintName:
-	"MERGE"
+|	"DERIVED_CONDITION_PUSHDOWN"
+|	"NO_DERIVED_CONDITION_PUSHDOWN"
 |	"HASH_JOIN"
 |	"NO_HASH_JOIN"
+|	"MERGE"
+|	"NO_MERGE"
 
-UnsupportedIndexLevelOptimizerHintName:
-	"INDEX_MERGE"
-/* NO_INDEX_MERGE is accepted only in nullary form */
+/**
+ * Index-level hints:
+ *
+ *	hint_name([@query_block_name] tbl_name [index_name [, index_name] ...])
+ *	hint_name(tbl_name@query_block_name [index_name [, index_name] ...])
+ *
+ * MySQL requires the table. NO_INDEX_MERGE has its own rule above, where
+ * the table is optional so that existing NO_INDEX_MERGE() and
+ * NO_INDEX_MERGE(@qb) input keeps parsing; such a hint restores unchanged.
+ */
+IndexLevelOptimizerHintName:
+	"GROUP_INDEX"
+|	"NO_GROUP_INDEX"
+|	"INDEX"
+|	"NO_INDEX"
+|	"INDEX_MERGE"
+|	"JOIN_INDEX"
+|	"NO_JOIN_INDEX"
 |	"MRR"
 |	"NO_MRR"
 |	"NO_ICP"
 |	"NO_RANGE_OPTIMIZATION"
+|	"ORDER_INDEX"
+|	"NO_ORDER_INDEX"
 |	"SKIP_SCAN"
 |	"NO_SKIP_SCAN"
 
-SupportedIndexLevelOptimizerHintName:
-	"ORDER_INDEX"
-|	"NO_ORDER_INDEX"
-
-SubqueryOptimizerHintName:
+SemijoinOptimizerHintName:
 	"SEMIJOIN"
 |	"NO_SEMIJOIN"
 
-SubqueryStrategy:
+SemijoinStrategy:
 	"DUPSWEEDOUT"
 |	"FIRSTMATCH"
 |	"LOOSESCAN"
 |	"MATERIALIZATION"
 
-NullaryHintName:
-	"NO_INDEX_MERGE"
+SubqueryStrategy:
+	"INTOEXISTS"
+|	"MATERIALIZATION"
 
 Identifier:
+	UnquotedIdentifier
+|	hintQuotedIdentifier
+
+UnquotedIdentifier:
 	hintIdentifier
 /* MySQL 8.0 hint names */
 |	"JOIN_FIXED_ORDER"
@@ -513,6 +606,15 @@ Identifier:
 |	"ORDER_INDEX"
 |	"NO_ORDER_INDEX"
 |	"MAX_EXECUTION_TIME"
+|	"DERIVED_CONDITION_PUSHDOWN"
+|	"NO_DERIVED_CONDITION_PUSHDOWN"
+|	"GROUP_INDEX"
+|	"NO_GROUP_INDEX"
+|	"INDEX"
+|	"NO_INDEX"
+|	"JOIN_INDEX"
+|	"NO_JOIN_INDEX"
+|	"SUBQUERY"
 |	"SET_VAR"
 |	"RESOURCE_GROUP"
 |	"QB_NAME"
@@ -521,4 +623,5 @@ Identifier:
 |	"FIRSTMATCH"
 |	"LOOSESCAN"
 |	"MATERIALIZATION"
+|	"INTOEXISTS"
 %%
