@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/spirit/pkg/parser/charset"
 	"github.com/block/spirit/pkg/parser/format"
 	"github.com/block/spirit/pkg/parser/types"
 )
@@ -550,6 +551,13 @@ func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) (bool, error) {
 	name, isString := csArg.GetValue().(string)
 	if csArg.GetValue() != nil && !isString {
 		return false, nil
+	}
+	// The charset is written as a keyword, so it must be a real charset name,
+	// never an arbitrary string.
+	if isString {
+		if _, err := charset.GetCharsetInfo(name); err != nil {
+			return false, nil
+		}
 	}
 	ctx.WriteKeyWord("CHAR")
 	ctx.WritePlain("(")
