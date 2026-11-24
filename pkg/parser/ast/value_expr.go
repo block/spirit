@@ -40,6 +40,10 @@ type ValueExpr struct {
 
 // Restore implements Node interface.
 func (n *ValueExpr) Restore(ctx *format.RestoreCtx) error {
+	// The grammar flags a charset introducer written in the query (_latin1'a').
+	// RestoreStringWithoutExplicitDefaultCharset opts out for the default charset.
+	explicitIntroducer := n.Type.GetFlag()&mysql.UnderScoreCharsetFlag != 0 &&
+		(!ctx.Flags.HasStringWithoutExplicitDefaultCharset() || n.Type.GetCharset() != mysql.DefaultCharset)
 	switch n.Kind() {
 	case KindNull:
 		ctx.WriteKeyWord("NULL")
@@ -60,9 +64,15 @@ func (n *ValueExpr) Restore(ctx *format.RestoreCtx) error {
 	case KindFloat64:
 		ctx.WritePlain(strconv.FormatFloat(n.GetFloat64(), 'e', -1, 64))
 	case KindString:
+		// RestoreStringWithoutDefaultCharset only suppresses the implicit
+		// default charset the parser attaches to every string. An introducer
+		// the query wrote (_utf8mb4'a') changes what the literal means and
+		// is always kept.
 		if n.Type.GetCharset() != "" &&
 			!ctx.Flags.HasStringWithoutCharset() &&
-			(!ctx.Flags.HasStringWithoutDefaultCharset() || n.Type.GetCharset() != mysql.DefaultCharset) {
+			(explicitIntroducer ||
+				!ctx.Flags.HasStringWithoutDefaultCharset() ||
+				n.Type.GetCharset() != mysql.DefaultCharset) {
 			ctx.WritePlain("_")
 			ctx.WriteKeyWord(n.Type.GetCharset())
 		}
@@ -72,9 +82,12 @@ func (n *ValueExpr) Restore(ctx *format.RestoreCtx) error {
 	case KindMysqlDecimal:
 		ctx.WritePlain(n.GetMysqlDecimal().String())
 	case KindBinaryLiteral:
-		if n.Type.GetCharset() != "" && n.Type.GetCharset() != mysql.DefaultCharset &&
+		// An unintroduced hex or bit literal is a binary string, so dropping
+		// an explicit introducer (_utf8mb4 X'61') changes its charset.
+		if n.Type.GetCharset() != "" &&
 			!ctx.Flags.HasStringWithoutCharset() &&
-			n.Type.GetCharset() != charset.CharsetBin {
+			(explicitIntroducer ||
+				(n.Type.GetCharset() != mysql.DefaultCharset && n.Type.GetCharset() != charset.CharsetBin)) {
 			ctx.WritePlain("_")
 			ctx.WriteKeyWord(n.Type.GetCharset() + " ")
 		}

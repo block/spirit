@@ -244,6 +244,13 @@ const (
 	// generated-column expressions, for instance. Default SQL restore keeps
 	// user-written parentheses so a statement round-trips as written.
 	RestoreSkipRedundantParentheses
+	// RestoreStringWithoutExplicitDefaultCharset makes RestoreStringWithoutDefaultCharset
+	// also drop a default-charset (_utf8mb4) introducer the query wrote. It is
+	// meant for canonicalization paths that must compare a written _utf8mb4'x'
+	// equal to a bare 'x'. Without it, RestoreStringWithoutDefaultCharset keeps
+	// every introducer the query wrote, because dropping one changes what the
+	// literal means (_utf8mb4 X'61' is a utf8mb4 string, X'61' is binary).
+	RestoreStringWithoutExplicitDefaultCharset
 )
 
 const (
@@ -326,6 +333,12 @@ func (rf RestoreFlags) HasRestoreBracketAroundBinaryOperation() bool {
 // whether `rf` has `RestoreStringWithoutDefaultCharset` flag.
 func (rf RestoreFlags) HasStringWithoutDefaultCharset() bool {
 	return rf.has(RestoreStringWithoutDefaultCharset)
+}
+
+// HasStringWithoutExplicitDefaultCharset returns a boolean indicating
+// whether `rf` has `RestoreStringWithoutExplicitDefaultCharset` flag.
+func (rf RestoreFlags) HasStringWithoutExplicitDefaultCharset() bool {
+	return rf.has(RestoreStringWithoutExplicitDefaultCharset)
 }
 
 // HasRestoreBracketAroundBetweenExpr returns a boolean indicating
