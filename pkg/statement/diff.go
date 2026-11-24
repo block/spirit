@@ -101,6 +101,25 @@ type DiffOptions struct {
 	// `orders` and `Orders` are different tables.
 	// Default: 0 (via NewDiffOptions), comparing names exactly.
 	LowerCaseTableNames int
+
+	// DefaultSchema is the schema the tables being diffed live in. A parsed
+	// CREATE TABLE does not know it, and SHOW CREATE TABLE qualifies a
+	// foreign key's referenced table only when it is in another schema, so
+	// an unqualified REFERENCES means the table's own schema.
+	//
+	// When set, Diff resolves an unqualified reference to DefaultSchema on
+	// both sides before comparing: `REFERENCES parent` equals
+	// `REFERENCES <DefaultSchema>.parent` and differs from
+	// `REFERENCES other_db.parent`, which the diff then emits as a foreign
+	// key change. Schema names are compared exactly, the way the referenced
+	// table names are; a case-folding server is not modelled.
+	//
+	// When empty, an unqualified reference matches any schema: two references
+	// differ only if both are qualified with different schemas. A diff that
+	// emits a foreign key leaves its reference as the target spells it, so
+	// an unqualified one stays unqualified.
+	// Default: "" (via NewDiffOptions).
+	DefaultSchema string
 }
 
 // NewDiffOptions returns DiffOptions with sensible defaults.

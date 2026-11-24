@@ -370,6 +370,8 @@ type Constraint struct {
 
 A `ForeignKeyReference` records the referenced `Schema` when the reference is qualified (`REFERENCES db.parent`) and leaves it empty otherwise. MySQL qualifies a reference in `SHOW CREATE TABLE` only when the parent is in another schema, and a reference qualified with the table's own schema reads back unqualified, so an empty `Schema` means the table's own schema — which a parsed `CREATE TABLE` does not know. Two references therefore differ on schema only when both are qualified and name different schemas; a desired `REFERENCES db2.parent` is not told apart from a live `REFERENCES parent`.
 
+`DiffOptions.DefaultSchema` removes that blind spot. Set it to the schema the tables live in (`opts.DefaultSchema = "mydb"`) and `Diff` resolves an unqualified reference to it on both sides before comparing: `parent` equals `mydb.parent`, and `parent` differs from `other_db.parent`, which the diff emits as a foreign key change (a `DROP FOREIGN KEY` plus an `ADD CONSTRAINT` under a replacement name). Schema names are compared exactly, as the referenced table names are. A reference the diff emits is written as the target spells it, so an unqualified one stays unqualified. Left empty (the default), the behavior above is unchanged.
+
 ### Partition Information
 
 For partitioned tables, `PartitionOptions` provides:
