@@ -143,8 +143,9 @@ func TestCharRestore(t *testing.T) {
 		{"CHAR(65 USING utf8mb4)", "CHAR(65 USING UTF8MB4)"},
 		{"char(30, a using binary)", "CHAR(30, `a` USING BINARY)"},
 		// A function a user named char_func is not CHAR(): restore it as written.
-		{"char_func()", "CHAR_FUNC()"},
-		{"char_func(1)", "CHAR_FUNC(1)"},
+		{"char_func()", "`char_func`()"},
+		{"char_func(1)", "`char_func`(1)"},
+		{"char_func(1, 'utf8mb4')", "`char_func`(1, _UTF8MB4'utf8mb4')"},
 		{"db.char_func(1, 'x')", "`db`.`char_func`(1, _UTF8MB4'x')"},
 	}
 	extractNodeFunc := func(node Node) Node {
@@ -189,20 +190,9 @@ func TestGenericFuncRestore(t *testing.T) {
 }
 
 func TestRestoreWithError(t *testing.T) {
-	testCases := []string{
-		"json_memberof()",
-	}
-
-	extractNodeFunc := func(node Node) Node {
-		return node.(*SelectStmt).Fields.Fields[0].Expr
-	}
-
-	for _, c := range testCases {
-		sql := "select " + c
-		p := parser.New()
-		stmt, err := p.ParseOneStmt(sql, "", "")
-		require.NoError(t, err)
-		var sb strings.Builder
-		require.Error(t, extractNodeFunc(stmt).Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)))
-	}
+	// The parser only builds a MEMBER OF call with two arguments, so build
+	// the malformed node by hand.
+	node := &FuncCallExpr{FnName: NewCIStr(JSONMemberOf)}
+	var sb strings.Builder
+	require.Error(t, node.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)))
 }

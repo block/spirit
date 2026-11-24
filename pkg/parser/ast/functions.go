@@ -371,20 +371,21 @@ func (n *FuncCallExpr) Restore(ctx *format.RestoreCtx) error {
 	switch {
 	case n.Tp == FuncCallExprTypeGeneric:
 		ctx.WriteName(n.FnName.O)
-	case n.FnName.L == InsertFunc && n.Schema.L == "":
+	case n.restoresAsSyntax() && n.FnName.L == InsertFunc:
 		// The parser names the INSERT(str, pos, len, newstr) string function
-		// insert_func internally. MySQL only knows it as INSERT. A
-		// schema-qualified user function named insert_func is
-		// FuncCallExprTypeGeneric and handled above; an unqualified call
-		// cannot be told apart from INSERT(), but insert_func is not a
-		// MySQL function name.
+		// insert_func internally. MySQL only knows it as INSERT. A user
+		// function named insert_func is FuncCallExprTypeGeneric, handled above.
 		ctx.WriteKeyWord("INSERT")
 	default:
 		ctx.WriteKeyWord(n.FnName.O)
 	}
 
 	ctx.WritePlain("(")
-	switch n.FnName.L {
+	special := ""
+	if n.restoresAsSyntax() {
+		special = n.FnName.L
+	}
+	switch special {
 	case "convert":
 		if err := n.Args[0].Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while restore FuncCastExpr.Expr: %w", err)
@@ -479,7 +480,20 @@ func (n *FuncCallExpr) Restore(ctx *format.RestoreCtx) error {
 	return nil
 }
 
+// restoresAsSyntax reports whether the call is one the grammar built from a
+// built-in's own syntax (CONVERT(x USING cs), TRIM(... FROM ...), CHAR(...
+// USING cs), the DATE '...' literal, ...), whose FnName selects a special
+// restore. A generic call (a user function, or a quoted name that merely
+// matches one of those names) and a schema-qualified call are restored as
+// written, name(args), never through those rewrites.
+func (n *FuncCallExpr) restoresAsSyntax() bool {
+	return n.Tp != FuncCallExprTypeGeneric && n.Schema.L == ""
+}
+
 func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
+	if !n.restoresAsSyntax() {
+		return false, nil
+	}
 	var specialLiteral string
 	switch n.FnName.L {
 	case DateLiteral:
@@ -522,19 +536,19 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 // restoreChar writes CHAR(N, ... [USING charset_name]). The parser names the
 // function char_func, which MySQL rejects, and appends the charset as a last
 // argument: a NULL value when there is no USING clause. A call without that
-// shape, such as a schema-qualified or zero-argument call to a function a
-// user named char_func, returns false so the caller restores it as written.
+// shape, or whose charset is not a known charset name, returns false so the
+// caller restores it as written.
 func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) (bool, error) {
 	if n.Schema.L != "" || len(n.Args) < 2 {
 		return false, nil
 	}
 	last := len(n.Args) - 1
-	charset, ok := n.Args[last].(*ValueExpr)
+	csArg, ok := n.Args[last].(*ValueExpr)
 	if !ok {
 		return false, nil
 	}
-	name, isString := charset.GetValue().(string)
-	if charset.GetValue() != nil && !isString {
+	name, isString := csArg.GetValue().(string)
+	if csArg.GetValue() != nil && !isString {
 		return false, nil
 	}
 	ctx.WriteKeyWord("CHAR")

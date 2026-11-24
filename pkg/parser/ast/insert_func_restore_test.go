@@ -11,12 +11,13 @@ import (
 
 // The INSERT(str, pos, len, newstr) string function is named insert_func
 // internally. It must restore as INSERT, and a user function that happens to be
-// called insert_func and is schema-qualified must keep its own name.
+// called insert_func must keep its own name.
 func TestInsertStringFunctionRestore(t *testing.T) {
 	cases := []struct{ src, want string }{
 		{"SELECT INSERT('abc', 1, 1, 'x')", "SELECT INSERT('abc', 1, 1, 'x')"},
 		{"select insert(a, 2, 3, b) from t", "SELECT INSERT(`a`, 2, 3, `b`) FROM `t`"},
 		{"SELECT 1 FROM t WHERE INSERT(a, 1, 0, 'x') = 'xa'", "SELECT 1 FROM `t` WHERE INSERT(`a`, 1, 0, 'x')='xa'"},
+		{"SELECT insert_func(1)", "SELECT `insert_func`(1)"},
 		{"SELECT d.insert_func(1)", "SELECT `d`.`insert_func`(1)"},
 	}
 	p := parser.New()

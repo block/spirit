@@ -13,6 +13,12 @@
 
 package parser
 
+import (
+	"strings"
+
+	"github.com/block/spirit/pkg/parser/ast"
+)
+
 func isLetter(ch byte) bool {
 	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
 }
@@ -970,4 +976,43 @@ func (s *Scanner) isTokenIdentifier(lit string, offset int) int {
 		tok = windowFuncTokenMap[string(data)]
 	}
 	return tok
+}
+
+// genericFuncCallType picks the FuncCallExprType of an unqualified call
+// name(...) that came through the generic function rule. The lexer turns an
+// unquoted keyword into its own token, so a name that is a keyword here was
+// written quoted (`trim`(1) is a stored function call, not TRIM), or with a
+// space before the parenthesis. A name with
+// characters outside an unquoted identifier, or one of the parser's internal
+// function names (insert_func, char_func, ...), must not be restored as a
+// bare keyword either. Those calls are FuncCallExprTypeGeneric and restore
+// as a quoted name. Any other name is a plain identifier, which may name a
+// MySQL built-in (ABS, CONCAT, ...). MySQL treats a quoted built-in name as a
+// stored function, so those stay FuncCallExprTypeKeyword and restore unquoted.
+func genericFuncCallType(name string) ast.FuncCallExprType {
+	upper := strings.ToUpper(name)
+	_, isBtFunc := btFuncTokenMap[upper]
+	if isInTokenMap(upper) || isBtFunc || !isPlainFuncName(name) {
+		return ast.FuncCallExprTypeGeneric
+	}
+	switch strings.ToLower(name) {
+	case ast.InsertFunc, ast.CharFunc, ast.JSONMemberOf:
+		return ast.FuncCallExprTypeGeneric
+	}
+	return ast.FuncCallExprTypeKeyword
+}
+
+// isPlainFuncName reports whether name is written as an unquoted identifier:
+// ASCII letters, digits, '_' and '$', not starting with a digit.
+func isPlainFuncName(name string) bool {
+	if name == "" || isDigit(name[0]) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !isLetter(c) && !isDigit(c) && c != '_' && c != '$' {
+			return false
+		}
+	}
+	return true
 }

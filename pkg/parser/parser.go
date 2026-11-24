@@ -18225,6 +18225,7 @@ yynewstate:
 	case 1442:
 		{
 			parser.yyVAL.expr = &ast.FuncCallExpr{
+				Tp:     genericFuncCallType(yyS[yypt-3].ident),
 				FnName: ast.NewCIStr(yyS[yypt-3].ident),
 				Args:   yyS[yypt-1].item.([]ast.ExprNode),
 			}
