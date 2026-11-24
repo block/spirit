@@ -2994,7 +2994,7 @@ func TestDiff_DiffOptions(t *testing.T) {
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=innodb",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=myisam",
 			opts:     &DiffOptions{IgnoreEngine: false},
-			expected: "ALTER TABLE `t1` ENGINE=myisam",
+			expected: "ALTER TABLE `t1` ENGINE=MyISAM",
 		},
 
 		// Explicit IgnoreAutoIncrement=false detects auto_increment changes

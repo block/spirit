@@ -1387,17 +1387,6 @@ func (ct *CreateTable) parseTableOptions(options []*ast.TableOption) *TableOptio
 }
 
 // Helper methods for TableOptions to handle nil safely
-// engineEqual reports whether two table ENGINE options name the same storage
-// engine. MySQL resolves engine names case-insensitively (ENGINE=innodb creates
-// an InnoDB table, and SHOW CREATE TABLE prints ENGINE=InnoDB), so the
-// comparison ignores case. Both nil is equal; one nil is unequal.
-func engineEqual(a, b *string) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return strings.EqualFold(*a, *b)
-}
-
 func (to *TableOptions) getEngine() *string {
 	if to == nil {
 		return nil
@@ -2803,7 +2792,7 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 
 	// Compare ENGINE
 	if !opts.IgnoreEngine {
-		if !engineEqual(ct.TableOptions.getEngine(), target.TableOptions.getEngine()) {
+		if !ptrEqual(ct.TableOptions.getEngine(), target.TableOptions.getEngine()) {
 			if engine := target.TableOptions.getEngine(); engine != nil {
 				clauses = append(clauses, fmt.Sprintf("ENGINE=%s", *engine))
 			}
