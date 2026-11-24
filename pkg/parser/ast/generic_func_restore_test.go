@@ -139,3 +139,26 @@ func TestBuiltinFuncNamesStayKeywords(t *testing.T) {
 		require.Equal(t, tc.want, restored)
 	}
 }
+
+// A quoted function name that the scanner would read as a keyword or a charset
+// introducer when unquoted must stay quoted on restore.
+func TestGenericFuncNameThatScansAsKeywordIsQuoted(t *testing.T) {
+	for _, name := range []string{"rank", "row_number", "lag", "ntile", "over", "groups", "_utf8mb4", "_binary", "_latin1"} {
+		t.Run(name, func(t *testing.T) {
+			restored, _ := restoreRoundTrip(t, "SELECT `"+name+"`(1)")
+			require.Equal(t, "SELECT `"+name+"`(1)", restored)
+		})
+	}
+}
+
+// MySQL 8.0 reserved words that are not keywords in this parser's token map
+// must still be restored quoted when used as a function name, since MySQL
+// rejects them bare.
+func TestGenericFuncNameReservedInMySQLIsQuoted(t *testing.T) {
+	for _, name := range []string{"cube", "sensitive", "specific", "read_write", "io_after_gtids", "master_ssl_verify_server_cert"} {
+		t.Run(name, func(t *testing.T) {
+			restored, _ := restoreRoundTrip(t, "SELECT `"+name+"`(1)")
+			require.Equal(t, "SELECT `"+name+"`(1)", restored)
+		})
+	}
+}

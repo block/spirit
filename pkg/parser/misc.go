@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/charset"
 )
 
 func isLetter(ch byte) bool {
@@ -982,17 +983,29 @@ func (s *Scanner) isTokenIdentifier(lit string, offset int) int {
 // name(...) that came through the generic function rule. The lexer turns an
 // unquoted keyword into its own token, so a name that is a keyword here was
 // written quoted (`trim`(1) is a stored function call, not TRIM), or with a
-// space before the parenthesis. A name with
-// characters outside an unquoted identifier, or one of the parser's internal
-// function names (insert_func, char_func, ...), must not be restored as a
-// bare keyword either. Those calls are FuncCallExprTypeGeneric and restore
-// as a quoted name. Any other name is a plain identifier, which may name a
-// MySQL built-in (ABS, CONCAT, ...). MySQL treats a quoted built-in name as a
-// stored function, so those stay FuncCallExprTypeKeyword and restore unquoted.
+// space before the parenthesis. A name must also be restored quoted when
+// written bare it would scan as something other than an identifier: a
+// keyword, a window function name (RANK, LAG, OVER, ...), a charset
+// introducer (_utf8mb4, _binary, ...), a name with characters outside an
+// unquoted identifier, or one of the parser's internal function names
+// (insert_func, char_func, ...). Those calls are FuncCallExprTypeGeneric and
+// restore as a quoted name. Any other name is a plain identifier, which may
+// name a MySQL built-in (ABS, CONCAT, ...). MySQL treats a quoted built-in
+// name as a stored function, so those stay FuncCallExprTypeKeyword and
+// restore unquoted.
+//
+// Known limit: the AST does not record whether a name was quoted, so `abs`(1)
+// (a stored function in MySQL) restores as ABS(1) (the built-in), while
+// `now`(1), whose name is a keyword here, stays quoted. Quoting every
+// built-in name would be worse: it would turn the built-in ABS(1) into a
+// stored function call.
 func genericFuncCallType(name string) ast.FuncCallExprType {
 	upper := strings.ToUpper(name)
 	_, isBtFunc := btFuncTokenMap[upper]
-	if isInTokenMap(upper) || isBtFunc || !isPlainFuncName(name) {
+	_, isWindowFunc := windowFuncTokenMap[upper]
+	if isInTokenMap(upper) || isBtFunc || isWindowFunc ||
+		mysqlReservedNotInTokenMap[upper] || scansAsCharsetIntroducer(name) ||
+		!isPlainFuncName(name) {
 		return ast.FuncCallExprTypeGeneric
 	}
 	switch strings.ToLower(name) {
@@ -1000,6 +1013,35 @@ func genericFuncCallType(name string) ast.FuncCallExprType {
 		return ast.FuncCallExprTypeGeneric
 	}
 	return ast.FuncCallExprTypeKeyword
+}
+
+// mysqlReservedNotInTokenMap holds the MySQL 8.0 reserved words that tokenMap
+// does not contain, so they scan as plain identifiers here. MySQL rejects them
+// unquoted as a function name, so a call to one must be restored quoted. They
+// are deliberately not added to the grammar's reserved set, which would change
+// what parses; this set is used only by genericFuncCallType.
+var mysqlReservedNotInTokenMap = map[string]bool{
+	"ACCESSIBLE":                    true,
+	"ASENSITIVE":                    true,
+	"CUBE":                          true,
+	"INSENSITIVE":                   true,
+	"IO_AFTER_GTIDS":                true,
+	"IO_BEFORE_GTIDS":               true,
+	"MASTER_BIND":                   true,
+	"MASTER_SSL_VERIFY_SERVER_CERT": true,
+	"READ_WRITE":                    true,
+	"SENSITIVE":                     true,
+	"SPECIFIC":                      true,
+}
+
+// scansAsCharsetIntroducer reports whether the scanner reads name as a charset
+// introducer: '_' followed by a known charset name.
+func scansAsCharsetIntroducer(name string) bool {
+	if !strings.HasPrefix(name, "_") {
+		return false
+	}
+	cs, _ := charset.GetCharsetInfo(name[1:])
+	return cs != nil
 }
 
 // isPlainFuncName reports whether name is written as an unquoted identifier:
