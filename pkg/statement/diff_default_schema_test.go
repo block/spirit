@@ -3,6 +3,7 @@ package statement
 import (
 	"testing"
 
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -88,4 +89,70 @@ func TestDiffDefaultSchemaRenamedForeignKey(t *testing.T) {
 	diff, err = DiffCreateTables("t", want, got, opts)
 	require.NoError(t, err)
 	assert.NotEmpty(t, diff)
+}
+
+// TestDefaultSchemaWithLowerCaseTableNames: on a case-folding server a
+// reference qualified with the table's own schema in another case is the same
+// reference as the unqualified one SHOW CREATE TABLE prints, so no foreign key
+// is dropped and re-added. Run through DeclarativeToImperative, where
+// matchReferenceCase aligns the case of references.
+func TestDefaultSchemaWithLowerCaseTableNames(t *testing.T) {
+	const live = "CREATE TABLE `orders` (\n  `id` int NOT NULL,\n  `cid` int DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `cid` (`cid`),\n  CONSTRAINT `fk_c` FOREIGN KEY (`cid`) REFERENCES `customers` (`id`)\n) ENGINE=InnoDB"
+	desired := func(ref string) string {
+		return "CREATE TABLE orders (id INT PRIMARY KEY, cid INT, KEY cid (cid), CONSTRAINT fk_c FOREIGN KEY (cid) REFERENCES " + ref + " (id))"
+	}
+	tests := []struct {
+		name                string
+		lowerCaseTableNames int
+		ref                 string
+		wantChange          bool
+	}{
+		{"OwnSchemaOtherCase", 1, "MyDB.customers", false},
+		{"OwnSchemaSameCase", 1, "mydb.customers", false},
+		{"Unqualified", 1, "customers", false},
+		{"UnqualifiedOtherTableCase", 1, "Customers", false},
+		{"OtherSchema", 1, "other_db.customers", true},
+		// Exact matching: a schema in another case is another schema.
+		{"ExactOwnSchemaOtherCase", 0, "MyDB.customers", true},
+		{"ExactOwnSchemaSameCase", 0, "mydb.customers", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewDiffOptions()
+			opts.LowerCaseTableNames = tc.lowerCaseTableNames
+			opts.DefaultSchema = "mydb"
+			changes, err := DeclarativeToImperative(
+				[]table.TableSchema{{Name: "orders", Schema: live}},
+				[]table.TableSchema{{Name: "orders", Schema: desired(tc.ref)}}, opts)
+			require.NoError(t, err)
+			if tc.wantChange {
+				assert.NotEmpty(t, statementsToStrings(changes))
+			} else {
+				assert.Empty(t, statementsToStrings(changes))
+			}
+		})
+	}
+}
+
+// DefaultSchema through DeclarativeToImperative, the entry point spirit diff
+// uses: an own-schema reference is not re-created, another schema's is.
+func TestDeclarativeDefaultSchema(t *testing.T) {
+	const live = "CREATE TABLE `orders` (\n  `id` int NOT NULL,\n  `cid` int DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `cid` (`cid`),\n  CONSTRAINT `fk_c` FOREIGN KEY (`cid`) REFERENCES `customers` (`id`)\n) ENGINE=InnoDB"
+	desired := func(ref string) string {
+		return "CREATE TABLE orders (id INT PRIMARY KEY, cid INT, KEY cid (cid), CONSTRAINT fk_c FOREIGN KEY (cid) REFERENCES " + ref + " (id))"
+	}
+	run := func(defaultSchema, ref string) []string {
+		opts := NewDiffOptions()
+		opts.DefaultSchema = defaultSchema
+		changes, err := DeclarativeToImperative(
+			[]table.TableSchema{{Name: "orders", Schema: live}},
+			[]table.TableSchema{{Name: "orders", Schema: desired(ref)}}, opts)
+		require.NoError(t, err)
+		return statementsToStrings(changes)
+	}
+	assert.Empty(t, run("mydb", "mydb.customers"))
+	assert.Empty(t, run("mydb", "customers"))
+	assert.Equal(t, []string{"ALTER TABLE `orders` DROP FOREIGN KEY `fk_c`, ADD CONSTRAINT `_fk_c_new` FOREIGN KEY (`cid`) REFERENCES `other_db`.`customers` (`id`)"}, run("mydb", "other_db.customers"))
+	// DefaultSchema unset: an unqualified live reference matches any schema.
+	assert.Empty(t, run("", "other_db.customers"))
 }
