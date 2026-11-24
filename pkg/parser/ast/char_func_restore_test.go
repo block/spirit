@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/spirit/pkg/parser"
 	. "github.com/block/spirit/pkg/parser/ast"
 	. "github.com/block/spirit/pkg/parser/format"
 	"github.com/stretchr/testify/require"
@@ -39,7 +40,7 @@ func TestCharFuncCallIsNotCharSyntax(t *testing.T) {
 }
 
 // A hand-built CHAR node whose charset is not a charset name is never written
-// as a keyword.
+// as a keyword, and is not restored as an ordinary call either: restoring fails.
 func TestCharRestoreRejectsArbitraryCharset(t *testing.T) {
 	bad := "binary) LIMIT 1000000 #"
 	node := &FuncCallExpr{
@@ -47,8 +48,18 @@ func TestCharRestoreRejectsArbitraryCharset(t *testing.T) {
 		Args:   []ExprNode{NewValueExpr(49, "", ""), NewValueExpr(bad, "", "")},
 	}
 	var sb strings.Builder
-	require.NoError(t, node.Restore(NewRestoreCtx(funcRestoreFlags, &sb)))
+	require.Error(t, node.Restore(NewRestoreCtx(funcRestoreFlags, &sb)))
 	require.NotContains(t, sb.String(), "USING")
-	require.NotContains(t, sb.String(), bad+"(")
-	require.Contains(t, sb.String(), "'"+bad+"'")
+	require.NotContains(t, sb.String(), bad)
+}
+
+// The grammar accepts any name after CHAR(... USING, so restore must reject an
+// unknown charset rather than write it as a char_func call.
+func TestCharUsingUnknownCharsetIsNotRestoredAsFunctionCall(t *testing.T) {
+	p := parser.New()
+	stmt, err := p.ParseOneStmt("SELECT CHAR(65 USING unknown_charset)", "", "")
+	require.NoError(t, err)
+	var sb strings.Builder
+	require.Error(t, stmt.Restore(NewRestoreCtx(funcRestoreFlags, &sb)))
+	require.NotContains(t, strings.ToLower(sb.String()), "char_func")
 }

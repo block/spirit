@@ -537,8 +537,9 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 // restoreChar writes CHAR(N, ... [USING charset_name]). The parser names the
 // function char_func, which MySQL rejects, and appends the charset as a last
 // argument: a NULL value when there is no USING clause. A call without that
-// shape, or whose charset is not a known charset name, returns false so the
-// caller restores it as written.
+// shape returns false so the caller restores it as written. A call whose
+// charset is not a known charset name is an error: it cannot be written as a
+// keyword, and restoring it as an ordinary call would change its meaning.
 func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) (bool, error) {
 	if n.Schema.L != "" || len(n.Args) < 2 {
 		return false, nil
@@ -556,7 +557,7 @@ func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) (bool, error) {
 	// never an arbitrary string.
 	if isString {
 		if _, err := charset.GetCharsetInfo(name); err != nil {
-			return false, nil
+			return true, fmt.Errorf("an error occurred while restore FuncCallExpr.(CHAR): unknown character set %q: %w", name, err)
 		}
 	}
 	ctx.WriteKeyWord("CHAR")
