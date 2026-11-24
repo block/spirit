@@ -41,8 +41,10 @@ type ValueExpr struct {
 // Restore implements Node interface.
 func (n *ValueExpr) Restore(ctx *format.RestoreCtx) error {
 	// The grammar flags a charset introducer written in the query (_latin1'a').
-	// RestoreStringWithoutExplicitDefaultCharset opts out for the default charset.
-	explicitIntroducer := n.Type.GetFlag()&mysql.UnderScoreCharsetFlag != 0 &&
+	writtenIntroducer := n.Type.GetFlag()&mysql.UnderScoreCharsetFlag != 0
+	// RestoreStringWithoutExplicitDefaultCharset opts out for the default
+	// charset, on string literals only.
+	explicitIntroducer := writtenIntroducer &&
 		(!ctx.Flags.HasStringWithoutExplicitDefaultCharset() || n.Type.GetCharset() != mysql.DefaultCharset)
 	switch n.Kind() {
 	case KindNull:
@@ -83,10 +85,12 @@ func (n *ValueExpr) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain(n.GetMysqlDecimal().String())
 	case KindBinaryLiteral:
 		// An unintroduced hex or bit literal is a binary string, so dropping
-		// an explicit introducer (_utf8mb4 X'61') changes its charset.
+		// an explicit introducer (_utf8mb4 X'61') changes its charset. A
+		// written introducer is therefore kept whatever the flags say, even
+		// the default charset under RestoreStringWithoutExplicitDefaultCharset.
 		if n.Type.GetCharset() != "" &&
 			!ctx.Flags.HasStringWithoutCharset() &&
-			(explicitIntroducer ||
+			(writtenIntroducer ||
 				(n.Type.GetCharset() != mysql.DefaultCharset && n.Type.GetCharset() != charset.CharsetBin)) {
 			ctx.WritePlain("_")
 			ctx.WriteKeyWord(n.Type.GetCharset() + " ")

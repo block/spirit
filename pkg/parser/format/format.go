@@ -245,11 +245,15 @@ const (
 	// user-written parentheses so a statement round-trips as written.
 	RestoreSkipRedundantParentheses
 	// RestoreStringWithoutExplicitDefaultCharset makes RestoreStringWithoutDefaultCharset
-	// also drop a default-charset (_utf8mb4) introducer the query wrote. It is
-	// meant for canonicalization paths that must compare a written _utf8mb4'x'
-	// equal to a bare 'x'. Without it, RestoreStringWithoutDefaultCharset keeps
-	// every introducer the query wrote, because dropping one changes what the
-	// literal means (_utf8mb4 X'61' is a utf8mb4 string, X'61' is binary).
+	// also drop a default-charset (_utf8mb4) introducer the query wrote on a
+	// string literal. It is meant for canonicalization paths that must compare
+	// a written _utf8mb4'x' equal to a bare 'x'. It only takes effect together
+	// with RestoreStringWithoutDefaultCharset; on its own a string keeps the
+	// introducer, as it does under DefaultRestoreFlags. Without it,
+	// RestoreStringWithoutDefaultCharset keeps every introducer the query wrote.
+	// It never applies to hex or bit literals: dropping a written introducer
+	// from one changes what the literal means (_utf8mb4 X'61' is a utf8mb4
+	// string, X'61' is binary), so those always keep it.
 	RestoreStringWithoutExplicitDefaultCharset
 )
 

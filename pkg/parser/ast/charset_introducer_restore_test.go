@@ -73,10 +73,22 @@ func TestCharsetIntroducerRestoreWithoutCharset(t *testing.T) {
 }
 
 // Canonicalization paths opt in to also dropping a written default-charset
-// introducer, so _utf8mb4'x' compares equal to a bare 'x'. Other introducers stay.
+// introducer from a string, so _utf8mb4'x' compares equal to a bare 'x'. Other
+// introducers stay, and so does the introducer on a hex literal, where dropping
+// it would turn a utf8mb4 string into a binary one.
 func TestCharsetIntroducerRestoreWithoutExplicitDefaultCharset(t *testing.T) {
 	flags := DefaultRestoreFlags | RestoreStringWithoutDefaultCharset | RestoreStringWithoutExplicitDefaultCharset
 	require.Equal(t,
-		"SELECT 'a','b',x'61',_LATIN1'c',_LATIN1 x'61'",
+		"SELECT 'a','b',_UTF8MB4 x'61',_LATIN1'c',_LATIN1 x'61'",
 		restoreWithFlags(t, "SELECT _utf8mb4'a', 'b', _utf8mb4 X'61', _latin1'c', _latin1 X'61'", flags))
+}
+
+// RestoreStringWithoutExplicitDefaultCharset only takes effect together with
+// RestoreStringWithoutDefaultCharset. Alone, strings and hex literals both keep
+// a written introducer.
+func TestCharsetIntroducerRestoreExplicitFlagWithoutDefaultFlag(t *testing.T) {
+	flags := DefaultRestoreFlags | RestoreStringWithoutExplicitDefaultCharset
+	require.Equal(t,
+		"SELECT _UTF8MB4'a',_UTF8MB4'b',_UTF8MB4 x'61',x'62'",
+		restoreWithFlags(t, "SELECT _utf8mb4'a', 'b', _utf8mb4 X'61', X'62'", flags))
 }
