@@ -292,7 +292,6 @@ type Index struct {
     ParserName   *string           // For FULLTEXT indexes
     Options      map[string]string // Additional index options
     SecondaryEngineAttribute *string // JSON text as written; compared as JSON
-    Encryption *string // "Y" only: encryptionNormalizer drops 'N', which SHOW CREATE TABLE omits
 }
 ```
 
@@ -340,6 +339,7 @@ type TableOptions struct {
     DelayKeyWrite    bool
     AvgRowLength, MinRows, MaxRows *uint64
     SecondaryEngineAttribute *string // JSON text as written; compared as JSON
+    Encryption *string // "Y" or "N" (upper-cased); nil = not specified, never changed by Diff
 }
 ```
 
