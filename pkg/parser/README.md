@@ -77,7 +77,16 @@ syntax. Forking lets us:
   output. ENUM and SET columns restore an explicit charset, binary
   included (`ENUM('a','b') CHARACTER SET BINARY`); upstream writes a
   column charset only for CHAR/VARCHAR/TEXT, so the restored DDL created
-  the column in the table's default charset.
+  the column in the table's default charset. Every MySQL 8.0/8.4
+  optimizer hint is kept in the AST and restored (upstream drops the
+  ones TiDB does not implement, such as `BKA`, `INDEX` or `SEMIJOIN`,
+  with a warning). Hint strings are scanned the way MySQL's hint lexer
+  scans them, with no backslash escapes, and a `SET_VAR` value restores
+  quoted or unquoted as it was written, so MySQL reads the restored hint
+  the same way. A hint whose text would contain `*/` fails `Restore`
+  instead of ending the comment early. As in MySQL, a syntax error in a
+  hint comment keeps the hints before it (with a warning) and drops the
+  rest of the comment.
 
 The AST (`ast` package), `format` restore machinery, `charset`, `mysql`
 constants, `opcode`, and `types` packages keep their upstream shapes, so
