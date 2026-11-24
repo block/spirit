@@ -244,6 +244,44 @@ func TestParseHint(t *testing.T) {
 			errs:  []string{`Optimizer hint syntax error at line 1 `},
 		},
 		{
+			// MySQL requires the table of an index-level hint. Only
+			// NO_INDEX_MERGE keeps accepting an empty or @qb-only list.
+			input: "INDEX()",
+			errs:  []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
+			input: "MRR()",
+			errs:  []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
+			input: "GROUP_INDEX(@qb1)",
+			errs:  []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
+			input: "NO_INDEX_MERGE(@qb1) NO_INDEX_MERGE()",
+			output: []*ast.TableOptimizerHint{
+				{HintName: ast.NewCIStr("NO_INDEX_MERGE"), QBName: ast.NewCIStr("qb1")},
+				{HintName: ast.NewCIStr("NO_INDEX_MERGE")},
+			},
+		},
+		{
+			// Like MySQL, a syntax error keeps the hints before it and drops
+			// the rest of the comment.
+			input: "BKA(t1) unknown_hint() INDEX(t2 i1)",
+			output: []*ast.TableOptimizerHint{
+				{HintName: ast.NewCIStr("BKA"), Tables: []ast.HintTable{{TableName: ast.NewCIStr("t1")}}},
+			},
+			errs: []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
+			input: "BKA(t1) NO_BKA(t2) INDEX() NO_ICP(t3)",
+			output: []*ast.TableOptimizerHint{
+				{HintName: ast.NewCIStr("BKA"), Tables: []ast.HintTable{{TableName: ast.NewCIStr("t1")}}},
+				{HintName: ast.NewCIStr("NO_BKA"), Tables: []ast.HintTable{{TableName: ast.NewCIStr("t2")}}},
+			},
+			errs: []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
 			input: "MAX_EXECUTION_TIME(1000) MAX_EXECUTION_TIME(@qb1 3000)",
 			output: []*ast.TableOptimizerHint{
 				{

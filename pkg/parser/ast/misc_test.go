@@ -201,6 +201,13 @@ func TestTableOptimizerHintRestore(t *testing.T) {
 		{"SET_VAR(sort_buffer_size = -0)", "SET_VAR(sort_buffer_size = -0)"},
 		{"SET_VAR(x = -9223372036854775808)", "SET_VAR(x = -9223372036854775808)"},
 		{"SET_VAR(x = -0.3)", "SET_VAR(x = -0.3)"},
+		// A quoted variable name that is not a plain word is written back
+		// quoted, so it stays one name.
+		{"SET_VAR(`sort_buffer_size` = 1)", "SET_VAR(sort_buffer_size = 1)"},
+		{"SET_VAR(`a b` = 1)", "SET_VAR(`a b` = 1)"},
+		{"SET_VAR(`a``b` = 1)", "SET_VAR(`a``b` = 1)"},
+		// QB_NAME with a view list (kept from the upstream parser).
+		{"QB_NAME(qb1, v1@sel_1 . v2)", "QB_NAME(`qb1`, `v1`@`sel_1`. `v2`)"},
 	}
 	extractNodeFunc := func(node ast.Node) ast.Node {
 		return node.(*ast.SelectStmt).TableHints[0]
@@ -273,6 +280,63 @@ func TestOptimizerHintRestoreKeepsCommentClosed(t *testing.T) {
 		restored := sb.String()
 		require.Equal(t, tc.expect, restored, tc.sql)
 		require.Equal(t, 1, strings.Count(restored, "*/"), restored)
+	}
+}
+
+// TestOptimizerHintSetVarNameCannotAddHints checks that a quoted SET_VAR
+// variable name holding hint syntax restores as one hint, not several.
+func TestOptimizerHintSetVarNameCannotAddHints(t *testing.T) {
+	p := parser.New()
+	stmts, _, err := p.Parse("SELECT /*+ SET_VAR(`a = 1) MAX_EXECUTION_TIME(5000) SET_VAR(b` = 2) */ 1", "", "")
+	require.NoError(t, err)
+	require.Len(t, stmts[0].(*ast.SelectStmt).TableHints, 1)
+
+	var sb strings.Builder
+	require.NoError(t, stmts[0].Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)))
+	require.Equal(t, "SELECT /*+ SET_VAR(`a = 1) MAX_EXECUTION_TIME(5000) SET_VAR(b` = 2)*/ 1", sb.String())
+
+	again, _, err := p.Parse(sb.String(), "", "")
+	require.NoError(t, err)
+	require.Len(t, again[0].(*ast.SelectStmt).TableHints, 1, "restored: %s", sb.String())
+}
+
+// TestOptimizerHintRestoreStringFlags covers the hint string writer under
+// each string-quoting restore flag: only the quote character is doubled.
+func TestOptimizerHintRestoreStringFlags(t *testing.T) {
+	h := &ast.TableOptimizerHint{
+		HintName: ast.NewCIStr("SET_VAR"),
+		HintData: ast.HintSetVar{VarName: "x", Value: `a'b"c\d`, Quoted: true},
+	}
+	testCases := []struct {
+		flags  format.RestoreFlags
+		expect string
+	}{
+		{format.RestoreStringSingleQuotes, `SET_VAR(x = 'a''b"c\d')`},
+		{format.RestoreStringDoubleQuotes, `SET_VAR(x = "a'b""c\d")`},
+		{0, `SET_VAR(x = a'b"c\d)`},
+	}
+	for _, tc := range testCases {
+		var sb strings.Builder
+		require.NoError(t, h.Restore(format.NewRestoreCtx(tc.flags, &sb)))
+		require.Equal(t, tc.expect, sb.String())
+	}
+}
+
+// TestOptimizerHintRestoreUnexpectedData checks that a hand-built hint whose
+// HintData has the wrong type for its name fails Restore instead of
+// panicking.
+func TestOptimizerHintRestoreUnexpectedData(t *testing.T) {
+	hints := []*ast.TableOptimizerHint{
+		{HintName: ast.NewCIStr("MAX_EXECUTION_TIME"), HintData: "1000"},
+		{HintName: ast.NewCIStr("MAX_EXECUTION_TIME")},
+		{HintName: ast.NewCIStr("RESOURCE_GROUP"), HintData: uint64(1)},
+		{HintName: ast.NewCIStr("SET_VAR"), HintData: "x"},
+		{HintName: ast.NewCIStr("SEMIJOIN"), HintData: "FIRSTMATCH"},
+		{HintName: ast.NewCIStr("SUBQUERY"), HintData: uint64(1)},
+	}
+	for _, h := range hints {
+		var sb strings.Builder
+		require.ErrorContains(t, h.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)), "unexpected data", "%#v", h)
 	}
 }
 

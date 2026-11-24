@@ -151,8 +151,17 @@ import (
 
 %%
 
+/*
+ * Like MySQL (start: hint_list error HINT_CLOSE), a syntax error keeps the
+ * hints parsed before it and drops the rest of the comment. The error is
+ * still reported as a warning.
+ */
 Start:
 	OptimizerHintList
+	{
+		parser.result = $1
+	}
+|	OptimizerHintList error
 	{
 		parser.result = $1
 	}
@@ -193,7 +202,13 @@ TableOptimizerHintOpt:
 		h.HintName = ast.NewCIStr($1)
 		$$ = h
 	}
-|	IndexLevelOptimizerHintName '(' HintIndexListOpt ')'
+|	IndexLevelOptimizerHintName '(' HintIndexList ')'
+	{
+		h := $3
+		h.HintName = ast.NewCIStr($1)
+		$$ = h
+	}
+|	"NO_INDEX_MERGE" '(' HintIndexListOpt ')'
 	{
 		h := $3
 		h.HintName = ast.NewCIStr($1)
@@ -524,9 +539,9 @@ TableLevelOptimizerHintName:
  *	hint_name([@query_block_name] tbl_name [index_name [, index_name] ...])
  *	hint_name(tbl_name@query_block_name [index_name [, index_name] ...])
  *
- * The table is optional here (MySQL requires it) so that existing
- * NO_INDEX_MERGE() and NO_INDEX_MERGE(@qb) input keeps parsing; such a hint
- * restores unchanged.
+ * MySQL requires the table. NO_INDEX_MERGE has its own rule above, where
+ * the table is optional so that existing NO_INDEX_MERGE() and
+ * NO_INDEX_MERGE(@qb) input keeps parsing; such a hint restores unchanged.
  */
 IndexLevelOptimizerHintName:
 	"GROUP_INDEX"
@@ -534,7 +549,6 @@ IndexLevelOptimizerHintName:
 |	"INDEX"
 |	"NO_INDEX"
 |	"INDEX_MERGE"
-|	"NO_INDEX_MERGE"
 |	"JOIN_INDEX"
 |	"NO_JOIN_INDEX"
 |	"MRR"

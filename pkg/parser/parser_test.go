@@ -816,6 +816,15 @@ func TestOptimizerHints(t *testing.T) {
 	}
 	require.Equal(t, []string{"bka", "no_bnl", "join_order", "mrr", "semijoin"}, names)
 
+	// A syntax error in the hint comment keeps the hints before it, with a
+	// warning, as MySQL does.
+	stmt, warns, err = p.Parse("SELECT /*+ BKA(t1) unknown_hint() */ 1", "", "")
+	require.NoError(t, err)
+	require.NotEmpty(t, warns)
+	selectStmt = stmt[0].(*ast.SelectStmt)
+	require.Len(t, selectStmt.TableHints, 1)
+	require.Equal(t, "bka", selectStmt.TableHints[0].HintName.L)
+
 	// TiDB-only hint names are unknown identifiers now, and also warn.
 	stmt, warns, err = p.Parse("select /*+ INL_JOIN(t1, t2), HASH_AGG(), READ_FROM_STORAGE(TIFLASH[t1]) */ c1 from t1", "", "")
 	require.NoError(t, err)

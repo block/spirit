@@ -2883,7 +2883,14 @@ func (n *TableOptimizerHint) Restore(ctx *format.RestoreCtx) error {
 			return fmt.Errorf("optimizer hint %s: unexpected data %T", n.HintName.O, n.HintData)
 		}
 		ctx.WritePlain(sep)
-		ctx.WritePlain(v.VarName)
+		if isHintWord(v.VarName) && v.VarName != "" {
+			ctx.WritePlain(v.VarName)
+		} else {
+			// A name from a quoted identifier can hold any text; write it
+			// back quoted (MySQL accepts a quoted variable name) so that it
+			// stays one name, whatever the restore flags.
+			ctx.WritePlain("`" + strings.ReplaceAll(v.VarName, "`", "``") + "`")
+		}
 		ctx.WritePlain(" = ")
 		if v.Quoted || !isBareHintValue(v.Value) {
 			writeHintString(ctx, v.Value)

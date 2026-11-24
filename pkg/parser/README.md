@@ -84,7 +84,9 @@ syntax. Forking lets us:
   scans them, with no backslash escapes, and a `SET_VAR` value restores
   quoted or unquoted as it was written, so MySQL reads the restored hint
   the same way. A hint whose text would contain `*/` fails `Restore`
-  instead of ending the comment early.
+  instead of ending the comment early. As in MySQL, a syntax error in a
+  hint comment keeps the hints before it (with a warning) and drops the
+  rest of the comment.
 
 The AST (`ast` package), `format` restore machinery, `charset`, `mysql`
 constants, `opcode`, and `types` packages keep their upstream shapes, so
