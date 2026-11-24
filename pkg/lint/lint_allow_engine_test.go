@@ -142,7 +142,7 @@ func TestAllowEngine_MultipleEnginesOneDisallowed(t *testing.T) {
 	violations := linter.Lint(nil, stmts1)
 	require.Len(t, violations, 1)
 	require.Equal(t, "t2", violations[0].Location.Table)
-	require.Contains(t, violations[0].Message, "Memory")
+	require.Contains(t, violations[0].Message, "MEMORY")
 }
 
 // Tests for different engine types
@@ -531,7 +531,7 @@ func TestAllowEngine_ComplexTableWithDisallowedEngine(t *testing.T) {
 	violations := linter.Lint(nil, stmts)
 	require.Len(t, violations, 1)
 	require.Equal(t, "cache_data", violations[0].Location.Table)
-	require.Contains(t, violations[0].Message, "Memory")
+	require.Contains(t, violations[0].Message, "MEMORY")
 }
 
 // Tests for configuration with trimming and normalization
