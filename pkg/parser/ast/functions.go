@@ -368,9 +368,18 @@ func (n *FuncCallExpr) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteName(n.Schema.O)
 		ctx.WritePlain(".")
 	}
-	if n.Tp == FuncCallExprTypeGeneric {
+	switch {
+	case n.Tp == FuncCallExprTypeGeneric:
 		ctx.WriteName(n.FnName.O)
-	} else {
+	case n.FnName.L == InsertFunc && n.Schema.L == "":
+		// The parser names the INSERT(str, pos, len, newstr) string function
+		// insert_func internally. MySQL only knows it as INSERT. A
+		// schema-qualified user function named insert_func is
+		// FuncCallExprTypeGeneric and handled above; an unqualified call
+		// cannot be told apart from INSERT(), but insert_func is not a
+		// MySQL function name.
+		ctx.WriteKeyWord("INSERT")
+	default:
 		ctx.WriteKeyWord(n.FnName.O)
 	}
 
