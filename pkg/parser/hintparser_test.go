@@ -106,20 +106,77 @@ func TestParseHint(t *testing.T) {
 			},
 		},
 		{
-			// MySQL hints TiDB never implemented parse but are reported
-			// (and dropped) as unsupported.
-			input: "JOIN_FIXED_ORDER() BKA()",
-			errs: []string{
-				`Optimizer hint JOIN_FIXED_ORDER is not supported`,
-				`Optimizer hint BKA is not supported`,
+			input: "JOIN_FIXED_ORDER() JOIN_FIXED_ORDER(@qb1) BKA() NO_BKA(@qb1 t1, t2) BNL(t1@qb1)",
+			output: []*ast.TableOptimizerHint{
+				{HintName: ast.NewCIStr("JOIN_FIXED_ORDER")},
+				{HintName: ast.NewCIStr("JOIN_FIXED_ORDER"), QBName: ast.NewCIStr("qb1")},
+				{HintName: ast.NewCIStr("BKA")},
+				{
+					HintName: ast.NewCIStr("NO_BKA"),
+					QBName:   ast.NewCIStr("qb1"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("t1")}, {TableName: ast.NewCIStr("t2")}},
+				},
+				{
+					HintName: ast.NewCIStr("BNL"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("t1"), QBName: ast.NewCIStr("qb1")}},
+				},
 			},
 		},
 		{
-			input: "SEMIJOIN(@qb1 FIRSTMATCH, LOOSESCAN) NO_SEMIJOIN(DUPSWEEDOUT, MATERIALIZATION)",
-			errs: []string{
-				`Optimizer hint SEMIJOIN is not supported`,
-				`Optimizer hint NO_SEMIJOIN is not supported`,
+			input: "JOIN_ORDER(@qb1 t1, t2) JOIN_PREFIX(t1@qb1) JOIN_SUFFIX(t2)",
+			output: []*ast.TableOptimizerHint{
+				{
+					HintName: ast.NewCIStr("JOIN_ORDER"),
+					QBName:   ast.NewCIStr("qb1"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("t1")}, {TableName: ast.NewCIStr("t2")}},
+				},
+				{
+					HintName: ast.NewCIStr("JOIN_PREFIX"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("t1"), QBName: ast.NewCIStr("qb1")}},
+				},
+				{
+					HintName: ast.NewCIStr("JOIN_SUFFIX"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("t2")}},
+				},
 			},
+		},
+		{
+			// JOIN_ORDER and friends require a table, as in MySQL.
+			input: "JOIN_ORDER()",
+			errs:  []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
+			input: "SEMIJOIN(@qb1 FIRSTMATCH, LOOSESCAN) NO_SEMIJOIN(DUPSWEEDOUT, MATERIALIZATION) SEMIJOIN() SUBQUERY(@qb1 INTOEXISTS) SUBQUERY(MATERIALIZATION)",
+			output: []*ast.TableOptimizerHint{
+				{
+					HintName: ast.NewCIStr("SEMIJOIN"),
+					QBName:   ast.NewCIStr("qb1"),
+					HintData: []string{"FIRSTMATCH", "LOOSESCAN"},
+				},
+				{
+					HintName: ast.NewCIStr("NO_SEMIJOIN"),
+					HintData: []string{"DUPSWEEDOUT", "MATERIALIZATION"},
+				},
+				{HintName: ast.NewCIStr("SEMIJOIN")},
+				{
+					HintName: ast.NewCIStr("SUBQUERY"),
+					QBName:   ast.NewCIStr("qb1"),
+					HintData: []string{"INTOEXISTS"},
+				},
+				{
+					HintName: ast.NewCIStr("SUBQUERY"),
+					HintData: []string{"MATERIALIZATION"},
+				},
+			},
+		},
+		{
+			// SUBQUERY takes exactly one strategy, and only these two.
+			input: "SUBQUERY(FIRSTMATCH)",
+			errs:  []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
+			input: "SUBQUERY()",
+			errs:  []string{`Optimizer hint syntax error at line 1 `},
 		},
 		{
 			input: "HASH_JOIN() NO_HASH_JOIN(x, `y y`.z@qb) MERGE(@qb1)",
@@ -157,12 +214,34 @@ func TestParseHint(t *testing.T) {
 			},
 		},
 		{
-			input: "MRR(tbl1 idx1) NO_ICP(tbl2) INDEX_MERGE(tbl3 x, y)",
-			errs: []string{
-				`Optimizer hint MRR is not supported`,
-				`Optimizer hint NO_ICP is not supported`,
-				`Optimizer hint INDEX_MERGE is not supported`,
+			input: "MRR(tbl1 idx1) NO_ICP(tbl2) INDEX_MERGE(@qb1 tbl3 x, y) INDEX(tbl1@qb2 PRIMARY)",
+			output: []*ast.TableOptimizerHint{
+				{
+					HintName: ast.NewCIStr("MRR"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("tbl1")}},
+					Indexes:  []ast.CIStr{ast.NewCIStr("idx1")},
+				},
+				{
+					HintName: ast.NewCIStr("NO_ICP"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("tbl2")}},
+				},
+				{
+					HintName: ast.NewCIStr("INDEX_MERGE"),
+					QBName:   ast.NewCIStr("qb1"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("tbl3")}},
+					Indexes:  []ast.CIStr{ast.NewCIStr("x"), ast.NewCIStr("y")},
+				},
+				{
+					HintName: ast.NewCIStr("INDEX"),
+					Tables:   []ast.HintTable{{TableName: ast.NewCIStr("tbl1"), QBName: ast.NewCIStr("qb2")}},
+					Indexes:  []ast.CIStr{ast.NewCIStr("PRIMARY")},
+				},
 			},
+		},
+		{
+			// An index-level hint names at most one table.
+			input: "INDEX(t1 a, t2 b)",
+			errs:  []string{`Optimizer hint syntax error at line 1 `},
 		},
 		{
 			input: "MAX_EXECUTION_TIME(1000) MAX_EXECUTION_TIME(@qb1 3000)",
@@ -212,6 +291,7 @@ func TestParseHint(t *testing.T) {
 					HintData: ast.HintSetVar{
 						VarName: "os",
 						Value:   "mcb=off",
+						Quoted:  true,
 					},
 				},
 				{
@@ -226,6 +306,7 @@ func TestParseHint(t *testing.T) {
 					HintData: ast.HintSetVar{
 						VarName: "os2",
 						Value:   "mcb2=off",
+						Quoted:  true,
 					},
 				},
 				{
@@ -239,7 +320,7 @@ func TestParseHint(t *testing.T) {
 					HintName: ast.NewCIStr("set_var"),
 					HintData: ast.HintSetVar{
 						VarName: "sel_plus",
-						Value:   "0.3",
+						Value:   "+0.3",
 					},
 				},
 				{
@@ -280,6 +361,18 @@ func TestParseHint(t *testing.T) {
 		{
 			input: "unknown_hint()",
 			errs:  []string{`Optimizer hint syntax error at line 1 `},
+		},
+		{
+			// MySQL's hint lexer processes no backslash escapes: only a
+			// doubled quote escapes the quote. 'a*\/ x' is the value a*\/ x,
+			// and 'ANSI\' is a complete string.
+			input: `SET_VAR(sql_mode='a*\/ x') SET_VAR(sql_mode='ANSI\') SET_VAR(sql_mode='AN''SI') SET_VAR(sql_mode='\n')`,
+			output: []*ast.TableOptimizerHint{
+				{HintName: ast.NewCIStr("SET_VAR"), HintData: ast.HintSetVar{VarName: "sql_mode", Value: `a*\/ x`, Quoted: true}},
+				{HintName: ast.NewCIStr("SET_VAR"), HintData: ast.HintSetVar{VarName: "sql_mode", Value: `ANSI\`, Quoted: true}},
+				{HintName: ast.NewCIStr("SET_VAR"), HintData: ast.HintSetVar{VarName: "sql_mode", Value: `AN'SI`, Quoted: true}},
+				{HintName: ast.NewCIStr("SET_VAR"), HintData: ast.HintSetVar{VarName: "sql_mode", Value: `\n`, Quoted: true}},
+			},
 		},
 		{
 			input: "set_var(timestamp = 1.5)",

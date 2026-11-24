@@ -132,7 +132,7 @@ func (hs *hintScanner) Lex(lval *yyhintSymType) int {
 	case stringLit:
 		lval.ident = lit
 		if hs.sqlMode.HasANSIQuotesMode() && hs.r.s[pos.Offset] == '"' {
-			return returnToken(hintIdentifier)
+			return returnToken(hintQuotedIdentifier)
 		}
 		return returnToken(hintStringLit)
 
@@ -152,7 +152,7 @@ func (hs *hintScanner) Lex(lval *yyhintSymType) int {
 
 	case quotedIdentifier:
 		lval.ident = lit
-		return returnToken(hintIdentifier)
+		return returnToken(hintQuotedIdentifier)
 
 	case eq:
 		return returnToken('=')
@@ -199,7 +199,14 @@ func (hp *hintParser) parse(input string, sqlMode mysql.SQLMode, initPos Pos) ([
 	hp.result = nil
 	hp.lexer.reset(input[3:])
 	hp.lexer.setVarValueState = hintSetVarValueStateNone
-	hp.lexer.SetSQLMode(sqlMode)
+	// MySQL's hint lexer does not process backslash escapes in quoted
+	// strings: only a doubled quote character escapes the quote, so
+	// SET_VAR(sql_mode='a\\b') sets the value a\\b. Scan hint strings the
+	// same way, so the AST holds the value MySQL reads and restoring it
+	// writes back the original text. Decoding escapes here would also let a
+	// value such as 'a*\/b' decode to a*/b, which ends the comment early once
+	// restored.
+	hp.lexer.SetSQLMode(sqlMode | mysql.ModeNoBackslashEscapes)
 	hp.lexer.r.updatePos(Pos{
 		Line:   initPos.Line,
 		Col:    initPos.Col + 3, // skipped the initial '/*+'

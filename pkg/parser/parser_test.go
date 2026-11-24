@@ -802,15 +802,19 @@ func TestOptimizerHints(t *testing.T) {
 	hints = selectStmt.TableHints
 	require.Len(t, hints, 1)
 	require.Equal(t, "set_var", hints[0].HintName.L)
-	require.Equal(t, ast.HintSetVar{VarName: "sql_mode", Value: "ANSI"}, hints[0].HintData)
+	require.Equal(t, ast.HintSetVar{VarName: "sql_mode", Value: "ANSI", Quoted: true}, hints[0].HintData)
 
-	// MySQL hints that the parser recognizes but does not model produce a
-	// warning and are dropped from the AST.
+	// Every MySQL hint is kept in the AST, without a warning.
 	stmt, warns, err := p.Parse("select /*+ BKA(t1), NO_BNL(t2), JOIN_ORDER(t3, t4), MRR(t5 idx1), SEMIJOIN(FIRSTMATCH) */ c1 from t1", "", "")
 	require.NoError(t, err)
-	require.Len(t, warns, 5)
+	require.Empty(t, warns)
 	selectStmt = stmt[0].(*ast.SelectStmt)
-	require.Empty(t, selectStmt.TableHints)
+	require.Len(t, selectStmt.TableHints, 5)
+	names := make([]string, 0, len(selectStmt.TableHints))
+	for _, h := range selectStmt.TableHints {
+		names = append(names, h.HintName.L)
+	}
+	require.Equal(t, []string{"bka", "no_bnl", "join_order", "mrr", "semijoin"}, names)
 
 	// TiDB-only hint names are unknown identifiers now, and also warn.
 	stmt, warns, err = p.Parse("select /*+ INL_JOIN(t1, t2), HASH_AGG(), READ_FROM_STORAGE(TIFLASH[t1]) */ c1 from t1", "", "")

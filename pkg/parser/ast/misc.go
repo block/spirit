@@ -2651,30 +2651,45 @@ type SelectStmtOpts struct {
 	ExplicitAll     bool
 }
 
-// TableOptimizerHint is Table level optimizer hint
+// TableOptimizerHint is one MySQL optimizer hint inside a /*+ ... */ comment.
+// See https://dev.mysql.com/doc/refman/8.4/en/optimizer-hints.html.
 type TableOptimizerHint struct {
 	node
-	// HintName is the name or alias of the table(s) which the hint will affect.
-	// Table hints has no schema info
-	// It allows only table name or alias (if table has an alias)
+	// HintName is the hint's name as written, e.g. BKA or NO_INDEX_MERGE.
 	HintName CIStr
 	// HintData is the payload of the hint. The actual type of this field
 	// depends on `HintName`:
 	//
-	// - MAX_EXECUTION_TIME  => uint64
-	// - RESOURCE_GROUP      => string
-	// - SET_VAR             => HintSetVar
+	// - MAX_EXECUTION_TIME              => uint64
+	// - RESOURCE_GROUP                  => string
+	// - SET_VAR                         => HintSetVar
+	// - SEMIJOIN, NO_SEMIJOIN, SUBQUERY => []string (the strategies, as
+	//   written; nil when a SEMIJOIN or NO_SEMIJOIN hint names none)
 	HintData any
-	// QBName is the default effective query block of this hint.
-	QBName  CIStr
-	Tables  []HintTable
+	// QBName is the default effective query block of this hint
+	// (`@qb_name` as the first argument), or the name a QB_NAME hint defines.
+	QBName CIStr
+	// Tables is the table list of a join-order, table-level or index-level
+	// hint. An index-level hint has at most one table.
+	Tables []HintTable
+	// Indexes is the index list of an index-level hint.
 	Indexes []CIStr
 }
 
 // HintSetVar is the payload of `SET_VAR` hint
 type HintSetVar struct {
 	VarName string
-	Value   string
+	// Value is the value as MySQL reads it. A quoted value is stored without
+	// its quotes; MySQL's hint lexer processes no backslash escapes, so
+	// neither does the parser.
+	Value string
+	// Quoted reports that the value was quoted: a string literal or a quoted
+	// identifier, which MySQL reads as a string. Restore writes it back as a
+	// string literal. An unquoted value, such as 1048576, 16M or OFF, is
+	// written back as is: MySQL reads a bare number as a number and rejects
+	// it as a string for a numeric variable. A value that is not a single
+	// bare token is quoted regardless.
+	Quoted bool
 }
 
 // HintTable is table in the hint. It may have query block info.
@@ -2698,52 +2713,89 @@ func (ht *HintTable) Restore(ctx *format.RestoreCtx) {
 	}
 }
 
+// hintCommentEnd ends the /*+ ... */ comment a hint is restored into. MySQL
+// finds the end of the comment before it parses the hints, so a restored hint
+// must not contain it anywhere, quoted or not.
+const hintCommentEnd = "*/"
+
+// checkCommentSafe returns an error when restoring the hint would write the
+// comment terminator. The hint parser cannot produce such a hint (its input
+// ends at the first */), but a hand-built AST can.
+func (n *TableOptimizerHint) checkCommentSafe() error {
+	texts := []string{n.HintName.O, n.QBName.O}
+	for _, t := range n.Tables {
+		texts = append(texts, t.DBName.O, t.TableName.O, t.QBName.O)
+	}
+	for _, idx := range n.Indexes {
+		texts = append(texts, idx.O)
+	}
+	switch data := n.HintData.(type) {
+	case string:
+		texts = append(texts, data)
+	case HintSetVar:
+		texts = append(texts, data.VarName, data.Value)
+	case []string:
+		texts = append(texts, data...)
+	}
+	for _, text := range texts {
+		if strings.Contains(text, hintCommentEnd) {
+			return fmt.Errorf("optimizer hint %s: %q contains %q, which would end the hint comment", n.HintName.O, text, hintCommentEnd)
+		}
+	}
+	return nil
+}
+
+// writeHintString writes a quoted string inside an optimizer hint. MySQL's
+// hint lexer escapes a quote by doubling it and processes no backslash
+// escapes, so the value is written as is apart from the doubled quotes.
+// format.RestoreCtx.WriteString would backslash-escape it, which changes the
+// value MySQL reads.
+func writeHintString(ctx *format.RestoreCtx, str string) {
+	switch {
+	case ctx.Flags.HasStringSingleQuotesFlag():
+		_, _ = ctx.In.WriteString("'" + strings.ReplaceAll(str, "'", "''") + "'")
+	case ctx.Flags.HasStringDoubleQuotesFlag():
+		_, _ = ctx.In.WriteString(`"` + strings.ReplaceAll(str, `"`, `""`) + `"`)
+	default:
+		_, _ = ctx.In.WriteString(str)
+	}
+}
+
+// isBareHintValue reports whether a SET_VAR value can be written unquoted: an
+// optionally signed run of letters, digits, '_', '$' and '.', with a sign
+// allowed after an exponent marker (1.5e-3).
+func isBareHintValue(v string) bool {
+	if v != "" && (v[0] == '+' || v[0] == '-') {
+		v = v[1:]
+	}
+	if v == "" {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_', c == '$', c == '.':
+		case (c == '+' || c == '-') && i > 0 && (v[i-1] == 'e' || v[i-1] == 'E'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Restore implements Node interface.
 func (n *TableOptimizerHint) Restore(ctx *format.RestoreCtx) error {
+	if err := n.checkCommentSafe(); err != nil {
+		return err
+	}
 	ctx.WriteKeyWord(n.HintName.String())
 	ctx.WritePlain("(")
-	if n.QBName.L != "" {
-		if n.HintName.L != "qb_name" {
-			ctx.WriteKeyWord("@")
-		}
+	defer ctx.WritePlain(")")
+
+	if n.HintName.L == "qb_name" {
+		// QB_NAME(name): the query block name is the argument, not an @qb
+		// prefix.
 		ctx.WriteName(n.QBName.String())
-	}
-	if n.HintName.L == "qb_name" && len(n.Tables) == 0 {
-		ctx.WritePlain(")")
-		return nil
-	}
-	// Hints without args except query block.
-	switch n.HintName.L {
-	case "no_index_merge", "merge":
-		ctx.WritePlain(")")
-		return nil
-	}
-	if n.QBName.L != "" {
-		ctx.WritePlain(" ")
-	}
-	// Hints with args except query block.
-	switch n.HintName.L {
-	case "max_execution_time":
-		ctx.WritePlainf("%d", n.HintData.(uint64))
-	case "resource_group":
-		ctx.WriteName(n.HintData.(string))
-	case "hash_join", "no_hash_join":
-		for i, table := range n.Tables {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			table.Restore(ctx)
-		}
-	case "order_index", "no_order_index":
-		n.Tables[0].Restore(ctx)
-		ctx.WritePlain(" ")
-		for i, index := range n.Indexes {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			ctx.WriteName(index.String())
-		}
-	case "qb_name":
 		if len(n.Tables) > 0 {
 			ctx.WritePlain(", ")
 			for i, table := range n.Tables {
@@ -2753,13 +2805,85 @@ func (n *TableOptimizerHint) Restore(ctx *format.RestoreCtx) error {
 				table.Restore(ctx)
 			}
 		}
-	case "set_var":
-		hintData := n.HintData.(HintSetVar)
-		ctx.WritePlain(hintData.VarName)
-		ctx.WritePlain(" = ")
-		ctx.WriteString(hintData.Value)
+		return nil
 	}
-	ctx.WritePlain(")")
+
+	// Every other hint may start with @qb_name; the rest of its arguments
+	// follow after a space.
+	sep := ""
+	if n.QBName.L != "" {
+		ctx.WriteKeyWord("@")
+		ctx.WriteName(n.QBName.String())
+		sep = " "
+	}
+
+	switch n.HintName.L {
+	case "max_execution_time":
+		v, ok := n.HintData.(uint64)
+		if !ok {
+			return fmt.Errorf("optimizer hint %s: unexpected data %T", n.HintName.O, n.HintData)
+		}
+		ctx.WritePlain(sep)
+		ctx.WritePlainf("%d", v)
+	case "resource_group":
+		v, ok := n.HintData.(string)
+		if !ok {
+			return fmt.Errorf("optimizer hint %s: unexpected data %T", n.HintName.O, n.HintData)
+		}
+		ctx.WritePlain(sep)
+		ctx.WriteName(v)
+	case "set_var":
+		v, ok := n.HintData.(HintSetVar)
+		if !ok {
+			return fmt.Errorf("optimizer hint %s: unexpected data %T", n.HintName.O, n.HintData)
+		}
+		ctx.WritePlain(sep)
+		ctx.WritePlain(v.VarName)
+		ctx.WritePlain(" = ")
+		if v.Quoted || !isBareHintValue(v.Value) {
+			writeHintString(ctx, v.Value)
+		} else {
+			ctx.WritePlain(v.Value)
+		}
+	case "semijoin", "no_semijoin", "subquery":
+		var strategies []string
+		if n.HintData != nil {
+			v, ok := n.HintData.([]string)
+			if !ok {
+				return fmt.Errorf("optimizer hint %s: unexpected data %T", n.HintName.O, n.HintData)
+			}
+			strategies = v
+		}
+		if len(strategies) > 0 {
+			ctx.WritePlain(sep)
+		}
+		for i, strategy := range strategies {
+			if i != 0 {
+				ctx.WritePlain(", ")
+			}
+			ctx.WriteKeyWord(strategy)
+		}
+	default:
+		// Join-order, table-level and index-level hints:
+		// [@qb] [tbl [, tbl] ...] and [@qb] tbl [idx [, idx] ...].
+		if len(n.Tables) > 0 {
+			ctx.WritePlain(sep)
+		}
+		for i, table := range n.Tables {
+			if i != 0 {
+				ctx.WritePlain(", ")
+			}
+			table.Restore(ctx)
+		}
+		for i, index := range n.Indexes {
+			if i == 0 {
+				ctx.WritePlain(" ")
+			} else {
+				ctx.WritePlain(", ")
+			}
+			ctx.WriteName(index.String())
+		}
+	}
 	return nil
 }
 
