@@ -251,6 +251,10 @@ const (
 	// with RestoreStringWithoutDefaultCharset; on its own a string keeps the
 	// introducer, as it does under DefaultRestoreFlags. Without it,
 	// RestoreStringWithoutDefaultCharset keeps every introducer the query wrote.
+	// The same applies to a CHARSET the query wrote on a CAST/CONVERT/JSON_VALUE
+	// RETURNING character type: CAST(x AS CHAR CHARACTER SET utf8mb4) restores
+	// with CHARSET utf8mb4 by default, since a bare CAST(x AS CHAR) can take a
+	// different collation, and as a bare CAST(x AS CHAR) under both flags.
 	// It never applies to hex or bit literals: dropping a written introducer
 	// from one changes what the literal means (_utf8mb4 X'61' is a utf8mb4
 	// string, X'61' is binary), so those always keep it.

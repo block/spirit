@@ -3777,3 +3777,55 @@ func TestDiffIntegrationExpressionGroupingValues(t *testing.T) {
 		})
 	}
 }
+
+// TestDiffIntegrationCastCharsetMatchesLive verifies that a CAST with an
+// explicit utf8mb4 charset and a bare CAST, written in generated
+// columns, CHECK constraints, column defaults and functional indexes, match
+// the live form SHOW CREATE TABLE reports. MySQL stores both spellings as
+// "char charset utf8mb4" from a utf8mb4 session, so a diff of either against
+// the live table must be empty; a latin1 cast is a different expression.
+func TestDiffIntegrationCastCharsetMatchesLive(t *testing.T) {
+	const tableName = "diff_cast_charset"
+	for _, tc := range []struct{ name, expr string }{
+		{"explicit utf8mb4", "cast(a as char character set utf8mb4)"},
+		{"bare", "cast(a as char)"},
+		{"explicit utf8mb4 with length", "cast(a as char(5) character set utf8mb4)"},
+		{"bare with length", "cast(a as char(5))"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ddl := fmt.Sprintf("CREATE TABLE %s (id int NOT NULL, a varchar(10), g varchar(10) AS (%s) VIRTUAL, CONSTRAINT chk_cast CHECK (%s <> 'x'), PRIMARY KEY (id), KEY fi ((%s))) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+				tableName, tc.expr, tc.expr, tc.expr)
+			tt := testutils.NewTestTable(t, tableName, ddl)
+			live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+			require.NoError(t, err)
+			// Every spelling is equal to the live form, whichever one the
+			// table was created from.
+			for _, other := range []string{
+				"cast(a as char character set utf8mb4)",
+				"cast(a as char)",
+				"cast(a as char(5) character set utf8mb4)",
+				"cast(a as char(5))",
+			} {
+				if strings.Contains(tc.expr, "(5)") != strings.Contains(other, "(5)") {
+					continue
+				}
+				desired, err := ParseCreateTable(fmt.Sprintf("CREATE TABLE %s (id int NOT NULL, a varchar(10), g varchar(10) AS (%s) VIRTUAL, CONSTRAINT chk_cast CHECK (%s <> 'x'), PRIMARY KEY (id), KEY fi ((%s))) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+					tableName, other, other, other))
+				require.NoError(t, err)
+				stmts, err := live.Diff(desired, nil)
+				require.NoError(t, err)
+				require.Nil(t, stmts, "%s must match the live form of %s", other, tc.expr)
+			}
+			// A latin1 cast is a different stored expression.
+			desired, err := ParseCreateTable(fmt.Sprintf("CREATE TABLE %s (id int NOT NULL, a varchar(10), g varchar(10) AS (cast(a as char character set latin1)) VIRTUAL, CONSTRAINT chk_cast CHECK (%s <> 'x'), PRIMARY KEY (id), KEY fi ((%s))) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+				tableName, tc.expr, tc.expr))
+			require.NoError(t, err)
+			if strings.Contains(tc.expr, "(5)") {
+				return
+			}
+			stmts, err := live.Diff(desired, nil)
+			require.NoError(t, err)
+			require.NotNil(t, stmts, "a latin1 cast must differ from %s", tc.expr)
+		})
+	}
+}
