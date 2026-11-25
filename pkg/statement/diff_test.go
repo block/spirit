@@ -1306,6 +1306,35 @@ func TestDiff(t *testing.T) {
 			expected: "",
 		},
 		{
+			// MySQL stores a bare CAST(x AS CHAR) from a utf8mb4 session as
+			// "char charset utf8mb4", the same text as an explicit
+			// CHARACTER SET utf8mb4, so the two must not diff.
+			name:     "CastExplicitDefaultCharsetEqualsBareInCheck",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, CONSTRAINT chk_cast CHECK ((cast(`a` as char charset utf8mb4) <> _utf8mb4'x')))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, CONSTRAINT chk_cast CHECK (CAST(a AS CHAR) <> 'x'))",
+			expected: "",
+		},
+		{
+			name:     "CastBareEqualsExplicitDefaultCharsetInGeneratedColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, g varchar(10) GENERATED ALWAYS AS (cast(`a` as char charset utf8mb4)) VIRTUAL)",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, g varchar(10) GENERATED ALWAYS AS (CAST(a AS CHAR)) VIRTUAL)",
+			expected: "",
+		},
+		{
+			name:     "ConvertExplicitDefaultCharsetEqualsBareInGeneratedColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, g varchar(10) GENERATED ALWAYS AS (CONVERT(a, CHAR CHARACTER SET utf8mb4)) VIRTUAL)",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, g varchar(10) GENERATED ALWAYS AS (CONVERT(a, CHAR)) VIRTUAL)",
+			expected: "",
+		},
+		{
+			// A non-default charset on the cast type is stored as written
+			// and is a different expression from a bare CAST.
+			name:     "CastNonDefaultCharsetDiffersFromBareInGeneratedColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, g varchar(10) GENERATED ALWAYS AS (cast(`a` as char charset latin1)) VIRTUAL)",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, g varchar(10) GENERATED ALWAYS AS (CAST(a AS CHAR)) VIRTUAL)",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `g` varchar(10) GENERATED ALWAYS AS (CAST(`a` AS CHAR)) VIRTUAL NULL",
+		},
+		{
 			// Parentheses that change operator binding are semantic, not
 			// cosmetic: (a OR b) AND c is a different constraint from
 			// a OR b AND c, and normalization must keep them distinct.

@@ -3777,3 +3777,83 @@ func TestDiffIntegrationExpressionGroupingValues(t *testing.T) {
 		})
 	}
 }
+
+// castCharsetSpellingGroups lists, per group, spellings of a character cast
+// that MySQL stores as one expression, and a spelling of the same cast with a
+// latin1 charset, which is a different expression. The first four are CAST;
+// NCHAR is stored as "char charset utf8mb3"; JSON_VALUE ... RETURNING CHAR is
+// the other position MySQL accepts a character type in.
+var castCharsetSpellingGroups = []struct {
+	name      string
+	spellings []string
+	latin1    string
+}{
+	{"char", []string{"cast(a as char character set utf8mb4)", "cast(a as char)"}, "cast(a as char character set latin1)"},
+	{"char with length", []string{"cast(a as char(5) character set utf8mb4)", "cast(a as char(5))"}, "cast(a as char(5) character set latin1)"},
+	{"nchar", []string{"cast(a as nchar)", "cast(a as char character set utf8)"}, "cast(a as char character set latin1)"},
+	{"json_value returning", []string{
+		"json_value(a, '$.a' returning char(10) character set utf8mb4)",
+		"json_value(a, '$.a' returning char(10))",
+	}, "json_value(a, '$.a' returning char(10) character set latin1)"},
+}
+
+// castCharsetDDL builds a table that uses expr in a generated column, a CHECK
+// constraint and a functional index, with genExpr in the generated column
+// (expr again when empty).
+func castCharsetDDL(tableName, expr, genExpr string) string {
+	if genExpr == "" {
+		genExpr = expr
+	}
+	return fmt.Sprintf("CREATE TABLE %s (id int NOT NULL, a varchar(10), g varchar(10) AS (%s) VIRTUAL, CONSTRAINT chk_cast CHECK (%s <> 'x'), PRIMARY KEY (id), KEY fi ((%s))) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		tableName, genExpr, expr, expr)
+}
+
+// TestDiffIntegrationCastCharsetMatchesLive verifies that a cast with an
+// explicit utf8mb4 charset and a bare cast, written in generated
+// columns, CHECK constraints and functional indexes, match the live form
+// SHOW CREATE TABLE reports, for CAST, NCHAR and JSON_VALUE ... RETURNING.
+// MySQL stores both spellings as "char charset utf8mb4" from a utf8mb4
+// session, so a diff of either against the live table must be empty.
+func TestDiffIntegrationCastCharsetMatchesLive(t *testing.T) {
+	const tableName = "diff_cast_charset"
+	for _, group := range castCharsetSpellingGroups {
+		for _, created := range group.spellings {
+			t.Run(group.name+"/created from "+created, func(t *testing.T) {
+				tt := testutils.NewTestTable(t, tableName, castCharsetDDL(tableName, created, ""))
+				live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+				require.NoError(t, err)
+				// Every spelling is equal to the live form, whichever one
+				// the table was created from.
+				for _, other := range group.spellings {
+					desired, err := ParseCreateTable(castCharsetDDL(tableName, other, ""))
+					require.NoError(t, err)
+					stmts, err := live.Diff(desired, nil)
+					require.NoError(t, err)
+					require.Nil(t, stmts, "%s must match the live form of %s", other, created)
+				}
+			})
+		}
+	}
+}
+
+// TestDiffIntegrationCastCharsetLatin1DiffersFromLive verifies that a cast to
+// latin1 is a different stored expression from the utf8mb4 spellings, so a diff
+// of a table created from either spelling against a latin1 cast is not empty.
+func TestDiffIntegrationCastCharsetLatin1DiffersFromLive(t *testing.T) {
+	const tableName = "diff_cast_charset_latin1"
+	for _, group := range castCharsetSpellingGroups {
+		for _, created := range group.spellings {
+			t.Run(group.name+"/created from "+created, func(t *testing.T) {
+				tt := testutils.NewTestTable(t, tableName, castCharsetDDL(tableName, created, ""))
+				live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+				require.NoError(t, err)
+				// Only the generated column changes to latin1.
+				desired, err := ParseCreateTable(castCharsetDDL(tableName, created, group.latin1))
+				require.NoError(t, err)
+				stmts, err := live.Diff(desired, nil)
+				require.NoError(t, err)
+				require.NotNil(t, stmts, "a latin1 cast must differ from %s", created)
+			})
+		}
+	}
+}

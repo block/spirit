@@ -254,6 +254,10 @@ const (
 	// It never applies to hex or bit literals: dropping a written introducer
 	// from one changes what the literal means (_utf8mb4 X'61' is a utf8mb4
 	// string, X'61' is binary), so those always keep it.
+	// It also covers a CHARSET the query wrote on a CAST/CONVERT/JSON_VALUE
+	// RETURNING character type: CAST(x AS CHAR CHARACTER SET utf8mb4) restores
+	// with CHARSET utf8mb4 by default, since a bare CAST(x AS CHAR) can take a
+	// different collation, and as a bare CAST(x AS CHAR) under both flags.
 	RestoreStringWithoutExplicitDefaultCharset
 )
 

@@ -333,11 +333,19 @@ func restoreExprText(expr ast.ExprNode, flags format.RestoreFlags) (string, bool
 		return "", false
 	}
 	var sb strings.Builder
-	rCtx := format.NewRestoreCtx(flags|format.RestoreStringWithoutDefaultCharset|format.RestoreStringWithoutExplicitDefaultCharset, &sb)
+	rCtx := format.NewRestoreCtx(canonicalRestoreFlags(flags), &sb)
 	if err := expr.Restore(rCtx); err != nil {
 		return "", false
 	}
 	return sb.String(), true
+}
+
+// canonicalRestoreFlags adds the charset policy restoreExprText applies to
+// flags. A comparison key built from anything other than restoreExprText, such
+// as a whole restored constraint, must use it so that an expression compares
+// the same way it does in every other path.
+func canonicalRestoreFlags(flags format.RestoreFlags) format.RestoreFlags {
+	return flags | format.RestoreStringWithoutDefaultCharset | format.RestoreStringWithoutExplicitDefaultCharset
 }
 
 // extractLengthFromTypeString extracts length from type string like

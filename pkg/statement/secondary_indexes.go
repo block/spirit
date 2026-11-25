@@ -387,8 +387,11 @@ func unnamedIndexDefinition(constraint *ast.Constraint) (string, error) {
 	case ast.ConstraintUniq, ast.ConstraintUniqKey:
 		bare.Tp = ast.ConstraintUniqIndex
 	}
+	// This text is only a comparison key, never emitted, so it is restored with
+	// the canonicalization flags: an explicit utf8mb4 cast in a key part and a
+	// bare cast are one expression to MySQL.
 	var sb strings.Builder
-	if err := bare.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)); err != nil {
+	if err := bare.Restore(format.NewRestoreCtx(canonicalRestoreFlags(format.DefaultRestoreFlags), &sb)); err != nil {
 		return "", fmt.Errorf("failed to restore index definition: %w", err)
 	}
 	return sb.String(), nil

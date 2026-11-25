@@ -608,7 +608,19 @@ func (ft *FieldType) RestoreAsCastType(ctx *format.RestoreCtx, explicitCharset b
 		if !skipWriteBinary && ft.flag&mysql.BinaryFlag != 0 {
 			ctx.WriteKeyWord(" BINARY")
 		}
-		if ft.charset != charset.CharsetBin && ft.charset != mysql.DefaultCharset {
+		// A charset the query wrote is kept even when it is the default
+		// one: CAST(x AS CHAR CHARACTER SET utf8mb4) takes that charset's
+		// default collation, while a bare CAST(x AS CHAR) takes the
+		// connection's collation, so dropping it can change the result.
+		// Canonicalization paths opt out of that for the default charset
+		// (RestoreStringWithoutExplicitDefaultCharset together with
+		// RestoreStringWithoutDefaultCharset), because MySQL stores both
+		// spellings as "char charset utf8mb4" when written from a utf8mb4
+		// session.
+		dropDefault := ft.charset == mysql.DefaultCharset &&
+			ctx.Flags.HasStringWithoutDefaultCharset() &&
+			ctx.Flags.HasStringWithoutExplicitDefaultCharset()
+		if ft.charset != charset.CharsetBin && !dropDefault {
 			ctx.WriteKeyWord(" CHARSET ")
 			ctx.WriteKeyWord(ft.charset)
 		}
