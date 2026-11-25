@@ -96,6 +96,8 @@ func TestCastCharsetRestoreCanonicalFlags(t *testing.T) {
 		{"convert utf8mb4", "SELECT CONVERT('a', CHAR CHARACTER SET utf8mb4)", canonicalRestoreFlags, "SELECT CONVERT('a', CHAR)"},
 		{"json_value utf8mb4", "SELECT JSON_VALUE(j, '$.a' RETURNING CHAR CHARACTER SET utf8mb4)", canonicalRestoreFlags, "SELECT JSON_VALUE(`j`, '$.a' RETURNING CHAR)"},
 		{"cast latin1", "SELECT CAST('a' AS CHAR CHARACTER SET latin1)", canonicalRestoreFlags, "SELECT CAST('a' AS CHAR CHARSET LATIN1)"},
+		{"cast utf8mb3", "SELECT CAST('a' AS CHAR CHARACTER SET utf8)", canonicalRestoreFlags, "SELECT CAST('a' AS CHAR CHARSET UTF8)"},
+		{"nchar", "SELECT CAST('a' AS NCHAR(5))", canonicalRestoreFlags, "SELECT CAST('a' AS CHAR(5) CHARSET UTF8)"},
 		{"cast binary", "SELECT CAST('a' AS CHAR CHARACTER SET binary)", canonicalRestoreFlags, "SELECT CAST('a' AS BINARY)"},
 		{"explicit flag alone", "SELECT CAST('a' AS CHAR CHARACTER SET utf8mb4)", DefaultRestoreFlags | RestoreStringWithoutExplicitDefaultCharset, "SELECT CAST(_UTF8MB4'a' AS CHAR CHARSET UTF8MB4)"},
 		{"default flag alone", "SELECT CAST('a' AS CHAR CHARACTER SET utf8mb4)", keepCharsetFlags, "SELECT CAST('a' AS CHAR CHARSET UTF8MB4)"},
