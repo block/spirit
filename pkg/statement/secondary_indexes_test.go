@@ -1102,3 +1102,21 @@ func TestRemoveSecondaryIndexesForeignKeySupport(t *testing.T) {
 	_, err = db.ExecContext(t.Context(), drop)
 	require.NoError(t, err, "MySQL refuses to drop an index a foreign key needs (1553)")
 }
+
+// An unnamed functional index is matched by its definition. An explicit
+// utf8mb4 cast and a bare cast are the same expression to MySQL, so they must
+// match, and a latin1 cast must not.
+func TestGetMissingSecondaryIndexesCastCharsetSpelling(t *testing.T) {
+	src := "CREATE TABLE t1 (id int NOT NULL, a varchar(10), PRIMARY KEY (id), KEY ((cast(`a` as char charset utf8mb4)))) DEFAULT CHARSET=utf8mb4"
+	tgt := "CREATE TABLE t1 (id int NOT NULL, a varchar(10), PRIMARY KEY (id), KEY `fi` ((cast(`a` as char)))) DEFAULT CHARSET=utf8mb4"
+	out, err := GetMissingSecondaryIndexes(src, tgt, "t1")
+	require.NoError(t, err)
+	require.Empty(t, out)
+
+	// A different charset is a different index, and the emitted DDL keeps
+	// the source spelling.
+	latin1 := "CREATE TABLE t1 (id int NOT NULL, a varchar(10), PRIMARY KEY (id), KEY ((cast(`a` as char charset latin1)))) DEFAULT CHARSET=utf8mb4"
+	out, err = GetMissingSecondaryIndexes(latin1, tgt, "t1")
+	require.NoError(t, err)
+	require.Contains(t, out, "LATIN1")
+}
