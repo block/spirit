@@ -1353,6 +1353,21 @@ func (n *SelectStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WritePlain(" ")
 	switch n.Kind {
 	case SelectStmtKindSelect:
+		// MySQL only recognizes an optimizer hint comment immediately after
+		// the SELECT keyword, so it must precede every modifier.
+		if len(n.TableHints) != 0 {
+			ctx.WritePlain("/*+ ")
+			for i, tableHint := range n.TableHints {
+				if i != 0 {
+					ctx.WritePlain(" ")
+				}
+				if err := tableHint.Restore(ctx); err != nil {
+					return fmt.Errorf("an error occurred while restore SelectStmt.TableHints[%d]: %w", i, err)
+				}
+			}
+			ctx.WritePlain("*/ ")
+		}
+
 		if n.Priority > 0 {
 			ctx.WriteKeyWord(mysql.Priority2Str[n.Priority])
 			ctx.WritePlain(" ")
@@ -1376,19 +1391,6 @@ func (n *SelectStmt) Restore(ctx *format.RestoreCtx) error {
 
 		if n.CalcFoundRows {
 			ctx.WriteKeyWord("SQL_CALC_FOUND_ROWS ")
-		}
-
-		if len(n.TableHints) != 0 {
-			ctx.WritePlain("/*+ ")
-			for i, tableHint := range n.TableHints {
-				if i != 0 {
-					ctx.WritePlain(" ")
-				}
-				if err := tableHint.Restore(ctx); err != nil {
-					return fmt.Errorf("an error occurred while restore SelectStmt.TableHints[%d]: %w", i, err)
-				}
-			}
-			ctx.WritePlain("*/ ")
 		}
 
 		if n.Distinct {

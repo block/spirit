@@ -311,7 +311,9 @@ func restoreExpressionText(expr ast.ExprNode) (string, bool) {
 // a bare literal parses to and which MySQL writes on every bare literal it
 // stores from a utf8mb4 session, so that a user's 'x' compares equal to the
 // _utf8mb4'x' SHOW CREATE TABLE reports for it
-// (format.RestoreStringWithoutDefaultCharset). Dropping every introducer
+// (format.RestoreStringWithoutDefaultCharset together with
+// format.RestoreStringWithoutExplicitDefaultCharset, which also drops a written
+// _utf8mb4). Dropping every introducer
 // (format.RestoreStringWithoutCharset) is reserved for literal-style
 // defaults, which MySQL converts to the column's charset and reports bare.
 //
@@ -331,7 +333,7 @@ func restoreExprText(expr ast.ExprNode, flags format.RestoreFlags) (string, bool
 		return "", false
 	}
 	var sb strings.Builder
-	rCtx := format.NewRestoreCtx(flags|format.RestoreStringWithoutDefaultCharset, &sb)
+	rCtx := format.NewRestoreCtx(flags|format.RestoreStringWithoutDefaultCharset|format.RestoreStringWithoutExplicitDefaultCharset, &sb)
 	if err := expr.Restore(rCtx); err != nil {
 		return "", false
 	}

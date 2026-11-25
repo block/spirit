@@ -72,3 +72,14 @@ func TestRestoreExprTextKeepsEveryIntroducerButUTF8MB4(t *testing.T) {
 		})
 	}
 }
+
+// A hex literal with no introducer is a binary string; _utf8mb4 X'61' is a
+// utf8mb4 string. A CHECK that changes one into the other is a real change.
+func TestDiffKeepsIntroducerOnHexLiteral(t *testing.T) {
+	const tail = ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	want := "CREATE TABLE `t` (`a` varbinary(10) DEFAULT NULL, CONSTRAINT `c` CHECK ((`a` = X'61'))" + tail
+	got := "CREATE TABLE `t` (`a` varbinary(10) DEFAULT NULL, CONSTRAINT `c` CHECK ((`a` = _utf8mb4 X'61'))" + tail
+	diff, err := DiffCreateTables("t", want, got, NewDiffOptions())
+	require.NoError(t, err)
+	require.NotEmpty(t, diff)
+}

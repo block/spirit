@@ -8176,6 +8176,7 @@ FunctionCallGeneric:
 	identifier '(' UDFExpressionListOpt ')'
 	{
 		$$ = &ast.FuncCallExpr{
+			Tp:     genericFuncCallType($1),
 			FnName: ast.NewCIStr($1),
 			Args:   $3.([]ast.ExprNode),
 		}
